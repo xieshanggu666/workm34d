@@ -17,10 +17,11 @@ const offerList = computed(() => store.applications.filter(a => a.offer))
 // Offer 发放（发起/重新发起）由「招聘负责人」提交审批：用人经理审批，薪资超带宽自动加签终审；
 // 审批通过后 Offer 才落库为「待回应」。调薪/接受/拒绝/入职/撤回为 HR 日常操作，限招聘负责人
 const isRecruiter = computed(() => store.myRole === 'recruiter')
+const canIssueOffer = computed(() => store.canSubmitTask('offer_issue'))
 function pendingOfferTask(a) { return store.pendingTask(a.id, 'offer_issue') }
 
 function openMake(a) {
-  if (!isRecruiter.value) { store.notify('error', '发起 Offer 需「招聘负责人」身份'); return }
+  if (!canIssueOffer.value) { store.notify('error', '发起 Offer 需「招聘负责人」（或其有效代理人）身份'); return }
   detail.value = a
   const p = store.positions.find(p => p.id === a.position_id)
   offerAmt.value = Math.round(a.offer?.salary || (p ? (p.salary_min + p.salary_max) / 2 : 22000))
@@ -79,7 +80,7 @@ function busy(id) { return !!store.pending[`offer:${id}`] }
             <div><b>{{ a.candidate }}</b><em class="muted">{{ a.position }}</em></div>
             <div class="muted">{{ a.city }}<span v-if="a.offer?.status === 'withdrawn'" class="reissue-hint">· 上次已撤回，可重新发起</span><span v-else-if="a.offer?.status === 'rejected'" class="reissue-hint">· 上次被拒绝，可重新发起</span></div>
             <span v-if="pendingOfferTask(a)" class="appr-pending-chip" :title="`发放审批 #${pendingOfferTask(a).id} 待审批`">⏳ 发放审批中</span>
-            <button v-else class="primary" :disabled="!isRecruiter" :title="isRecruiter ? '提交 Offer 发放审批（用人经理审批）' : '需「招聘负责人」身份'" @click="openMake(a)">{{ a.offer ? '重新发起' : '发起 Offer' }}</button>
+            <button v-else class="primary" :disabled="!canIssueOffer" :title="canIssueOffer ? '提交 Offer 发放审批（用人经理审批）' : '需「招聘负责人」或其代理人身份'" @click="openMake(a)">{{ a.offer ? '重新发起' : '发起 Offer' }}</button>
           </div>
           <div class="muted empty" v-if="!offerApps.length">当前无待发 Offer，先在「面试管理」给出通过结论并推进至 Offer 阶段。</div>
         </div>

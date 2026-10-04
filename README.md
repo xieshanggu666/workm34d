@@ -25,6 +25,7 @@ hr/
 │   ├── crisis.js                # 跨角色危机处置审计（哈希链/授权/工单/复盘）
 │   ├── schedule.js              # 双向预约协商（确认/改期/提醒/缺席/危机挂起重约）
 │   ├── schedule-risk.js         # 预约结果风险台账（统一责任判定/通知去重/阶段闸门/阶段恢复）
+│   ├── delegation.js            # 按角色委托 + 超时升级（代理路由/升级路由/SLA 扫描/通知定向）
 │   └── hr.db                    # SQLite 数据库文件
 └── src/
     ├── main.js
@@ -84,6 +85,9 @@ npm run dev     # 同时启动后端(4160) 与 前端 Vite
 | `appointments` | 双向预约单（协商状态机 `negotiating/confirmed/rescheduling/declined/completed/no_show/cancelled` + 双方确认位 `cand_confirmed/int_confirmed` + 改期提议 `pending_*` + 提醒幂等位 + `crisis_suspended/incident_id` 危机回退挂起标记） |
 | `appointment_messages` | 预约沟通留痕（发起/确认/改期/拒绝改期/婉拒/取消/提醒/缺席裁定/重约，只追加，形成协商时间线） |
 | `schedule_risk_events` | **预约结果风险台账**（缺席裁定/改期/重约统一入口：`responsible_party` 责任判定、`occurrence` 缺席场次号、改判旧行 `superseded`、重约确认 `resolved`；阶段闸门、看板徽标、风险报表共用同一口径） |
+| `delegations` | **按角色委托**：角色持有人把审批权在生效窗口+审批类型范围内委托给异角色成员（`active/scheduled/revoked`，唯一索引保证同一代理人对同一角色只有一份有效委托） |
+| `approval_step_routes` | **审批步骤路由**：`chain` 快照只固化角色，代理人/升级人作为独立路由追加（`kind=delegation/escalation`、`active/consumed/superseded`），审批链 JSON 永不改写 |
+| `escalation_config` | **超时升级配置**：按节点角色配置 SLA 小时数与升级目标角色/指定人（默认招聘负责人 24h→用人经理、用人经理 48h→招聘负责人） |
 
 ## 候选人↔面试官双向预约沟通（📅 预约沟通）
 
@@ -116,6 +120,18 @@ npm run dev     # 同时启动后端(4160) 与 前端 Vite
 - **结果回写**：终审通过在**同一事务**内调用与直接操作完全相同的业务函数（推进状态机 / 结论联动 / Offer 发起），回写招聘阶段、面试结论与 Offer 状态；执行时若业务状态已漂移（如阶段被其他操作变更），仅回滚执行段（SAVEPOINT），任务标记「执行失败」并通知申请人，审批留痕保留。
 - **防重复**：同一应聘同一类型仅允许一个进行中的审批；任务带 `version` 乐观锁防并发审批；越权操作返回 403 并提示所需角色。
 - **审计通知**：提交/逐级通过/退回/重提/撤销/生效/失败均写入 `approval_steps` 并按角色投递 `notifications`；顶栏铃铛查看未读，审批中心「全部记录」可审计每个任务的完整步骤时间线。
+
+## 按角色委托与超时升级（审批中心「🔑 委托管理 / ⏰ 超时升级」）
+
+针对请假、出差与审批人响应不及时，在不改写既有审批链快照的前提下，为**候选人推进、面试结论、Offer 发放、策略发布**四类审批提供按角色代理与 SLA 升级，授权、留痕、回写、通知在并发与撤销后保持一致。
+
+- **按角色委托**：角色持有人可把本人审批权委托给**其他角色**成员（同角色无需委托），委托时**事由必填**、可限定审批类型（默认全部）与生效时间窗；同一代理人对同一审批角色同时只能有一份有效委托（部分唯一索引兜底）。委托期间**本人与代理人并行有权**；代理人也可经委托**代发起申请**（任务记录实际发起人 `submitted_by`、提交角色快照 `submitted_role` 与委托单号 `submit_delegation_id`）。
+- **撤销即时生效**：设立人撤销委托时，同一事务内把挂在各在途任务上未消费的代理路由置 `superseded`、任务时间线追加 `delegate_revoke`、代理人未读定向待办归并已读；撤销后代理人再审批立即 403。**已经代理完成的步骤只留痕不回滚**（chain 角色快照 + step 实际处理人共同构成证据）。
+- **超时升级**：每个等待节点进入时写入 `step_due_at`（取自该节点角色的 SLA 配置）；审批中心「🔄 扫描超时」或服务启动调用 `GET /api/delegations/sweep`（幂等），到点的节点生成 `escalation` 路由并追加系统 `escalate` 留痕，升级人与**原审批角色并行有权**，升级只发生一次；扫描同时激活到生效窗口的待生效委托。
+- **审批链快照不改写**：`approval_tasks.chain` 仅在提交/重提时按角色固化；「某一步实际由谁以何种身份处理」写在独立的 `approval_step_routes`（`delegation/escalation`）与 `approval_steps`（actor=实际处理人、role=节点原角色、note 标注代理/升级身份）中。退回后重提作废旧链全部路由并从第一节点重新挂账（如薪资降回带宽内取消加签，旧升级不复活）。
+- **并发一致**：全部鉴权、路由消费、业务回写在 `BEGIN IMMEDIATE` 事务内完成，任务 `version` 乐观锁随升级/流转递增；任一处理人通过即把该节点**全部** active 路由置 `consumed`，重复点击/并发双审批只有一个成功（另一请求 409 `version_conflict`）；唯一索引为「同任务×步骤×授权人一条 active 路由」兜底。职责分离：代理人不能审批自己代理发起的申请。
+- **通知定向到人**：通知新增 `recipient_user_id`——代理/升级待办只进代理人/升级人个人铃铛（跨角色也能收到），角色广播不带定向；任务流转/退回/终审/撤销在同一事务内按处理人侧（可限定旧节点号，不误读新节点待办）与申请人侧归并失效未读，杜绝撤销/升级/代理切换后的红点残留。危机回退同步撤销任务时，未消费路由一并作废。
+- **API**：`POST /api/delegations`（设立委托）、`POST /api/delegations/:id/revoke`（撤销）、`GET /api/delegations/sweep`（超时/窗口扫描）、`GET/POST /api/escalation-config/:role`（读取/维护 SLA 与升级目标，仅招聘负责人可维护）；新增通知类型 `task_delegated/task_escalated/task_escalation_notice/delegation_granted/delegation_revoked`。
 
 ## 跨角色危机处置审计（🛡️ 危机审计）
 

@@ -33,6 +33,8 @@ function saveEval(iv) { store.setInterview(iv.id, { eval: iv.eval, interviewer: 
 // 面试结论（通过/不通过）由「面试官」提交审批，招聘负责人审批后生效并联动阶段；「待定」非终论可直接保存
 const isInterviewer = computed(() => store.myRole === 'interviewer')
 const isRecruiter = computed(() => store.myRole === 'recruiter')
+const canSubmitConclusion = computed(() => store.canSubmitTask('interview_conclusion'))
+const canSubmitAdvance = computed(() => store.canSubmitTask('stage_advance'))
 // 该面试是否存在进行中的结论审批
 function pendingConclusionTask(a, iv) {
   const t = store.pendingTask(a.id, 'interview_conclusion')
@@ -41,7 +43,7 @@ function pendingConclusionTask(a, iv) {
 function setConclusion(iv, c) {
   if (conclusionOf(iv) === c) return
   if (c === 'pending') { store.setInterview(iv.id, { conclusion: 'pending' }); return }
-  if (!isInterviewer.value) { store.notify('error', '面试结论需由「面试官」身份提交审批，请切换身份'); return }
+  if (!canSubmitConclusion.value) { store.notify('error', '面试结论需由「面试官」（或其有效代理人）提交审批，请切换身份'); return }
   store.submitApproval({
     type: 'interview_conclusion',
     application_id: detail.value.id,
@@ -59,7 +61,7 @@ function addRound() {
 function passAndAdvance(a) {
   const iv = lastInterview(a)
   if (!iv || conclusionOf(iv) !== 'pass') return
-  if (!isRecruiter.value) { store.notify('error', '提请推进需「招聘负责人」身份'); return }
+  if (!canSubmitAdvance.value) { store.notify('error', '提请推进需「招聘负责人」（或其有效代理人）身份'); return }
   store.submitApproval({ type: 'stage_advance', application_id: a.id, payload: { target_stage: 'offer' } })
 }
 </script>
@@ -107,11 +109,11 @@ function passAndAdvance(a) {
               <div class="ivres">
                 <button class="succ" :class="{ on: conclusionOf(iv) === 'pass' }"
                   :disabled="!!pendingConclusionTask(detail, iv)"
-                  :title="isInterviewer ? '提交「通过」结论审批（招聘负责人审批后生效）' : '需「面试官」身份提交结论审批'"
+                  :title="canSubmitConclusion ? '提交「通过」结论审批（招聘负责人审批后生效）' : '需「面试官」或其代理人身份提交结论审批'"
                   @click="setConclusion(iv, 'pass')">✅ 通过</button>
                 <button class="danger" :class="{ on: conclusionOf(iv) === 'fail' }"
                   :disabled="!!pendingConclusionTask(detail, iv)"
-                  :title="isInterviewer ? '提交「不通过」结论审批（招聘负责人审批后生效）' : '需「面试官」身份提交结论审批'"
+                  :title="canSubmitConclusion ? '提交「不通过」结论审批（招聘负责人审批后生效）' : '需「面试官」或其代理人身份提交结论审批'"
                   @click="setConclusion(iv, 'fail')">❌ 不通过</button>
                 <button class="ghost" :class="{ on: conclusionOf(iv) === 'pending' }"
                   :disabled="!!pendingConclusionTask(detail, iv)"

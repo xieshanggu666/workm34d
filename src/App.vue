@@ -35,6 +35,8 @@ const roleIcon = { recruiter: '🧭', interviewer: '💬', hiring_manager: '🏢
 const notifyIcon = {
   task_submitted: '📨', task_approved: '✅', task_returned: '↩️', task_resubmitted: '🔁',
   task_executed: '🎉', task_failed: '⚠️', task_cancelled: '🚫',
+  task_delegated: '🔑', task_escalated: '⏰', task_escalation_notice: '⏰',
+  delegation_granted: '🔑', delegation_revoked: '🔒',
   crisis_declared: '🚨', crisis_state: '⚡', crisis_commander: '🔀',
   crisis_grant: '🔑', crisis_grant_log: '🔑', crisis_grant_revoked: '🔒',
   crisis_rollback: '⏪', crisis_ticket: '🎫', crisis_ticket_assign: '🎫', crisis_ticket_update: '🎫',

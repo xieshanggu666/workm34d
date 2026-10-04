@@ -164,6 +164,7 @@ function isBusy(a) { return !!store.pending[busyKey(a)] || !!store.pending[`appr
 // ---- 角色权限与审批联动 ----
 // 推进/淘汰/回退属招聘负责人职责；推进不再直接生效，而是提交「候选人推进」审批，由用人经理审批后回写阶段
 const isRecruiter = computed(() => store.myRole === 'recruiter')
+const canSubmitAdvance = computed(() => store.canSubmitTask('stage_advance'))
 function pendingTaskOf(a, type) { return store.pendingTask(a.id, type) }
 // 预约风险画像（缺席/改期/重约台账口径）：看板卡片展示，与报表中心同源
 function riskOf(a) { return store.appRisk(a.id) }
@@ -174,7 +175,7 @@ function anyPendingTask(a) {
 const TASK_TYPE_LABEL = { stage_advance: '推进', interview_conclusion: '结论', offer_issue: 'Offer' }
 
 function onAdvance(a) {
-  if (advanceGate(a).blocked || !isRecruiter.value) return
+  if (advanceGate(a).blocked || !canSubmitAdvance.value) return
   const target = nextStage(a.stage)
   store.submitApproval({ type: 'stage_advance', application_id: a.id, payload: { target_stage: target } })
 }
@@ -307,8 +308,8 @@ function weightText(weights = {}) {
               <span class="muted">{{ a.city }}<template v-if="a.stage !== 'submitted'"> · v{{ a.version }}</template></span>
               <div class="ka">
                 <template v-if="nextStage(a.stage)">
-                  <button class="primary" :disabled="advanceGate(a).blocked || isBusy(a) || !isRecruiter || !!pendingTaskOf(a, 'stage_advance')"
-                    :title="!isRecruiter ? '需切换为「招聘负责人」身份提请推进' : pendingTaskOf(a, 'stage_advance') ? '推进审批中，待用人经理处理' : advanceGate(a).msg || '提交推进审批（用人经理审批后生效）'"
+                  <button class="primary" :disabled="advanceGate(a).blocked || isBusy(a) || !canSubmitAdvance || !!pendingTaskOf(a, 'stage_advance')"
+                    :title="!canSubmitAdvance ? '需切换为「招聘负责人」或其代理人身份提请推进' : pendingTaskOf(a, 'stage_advance') ? '推进审批中，待用人经理处理' : advanceGate(a).msg || '提交推进审批（用人经理审批后生效）'"
                     @click="onAdvance(a)">
                     {{ pendingTaskOf(a, 'stage_advance') ? '⏳ 审批中' : isBusy(a) ? '处理中…' : `提请 → ${nextStageLabel(a.stage)}` }}
                   </button>

@@ -402,8 +402,11 @@ function cancelPendingTasksForIncident(appId, { actor, reason }) {
   const stamp = ts()
   const cancelled = []
   tasks.forEach(t => {
-    db.prepare("UPDATE approval_tasks SET status='cancelled', decided_at=?, decide_note=?, version=version+1 WHERE id=?")
+    db.prepare("UPDATE approval_tasks SET status='cancelled', decided_at=?, decide_note=?, step_due_at='', version=version+1 WHERE id=?")
       .run(stamp, `危机处置同步撤销：${reason}`, t.id)
+    // 未消费的委托/升级路由一并作废，代理人/升级人在任务撤销后无权处理
+    db.prepare("UPDATE approval_step_routes SET status='superseded', superseded_at=?, superseded_by=? WHERE task_id=? AND status='active'")
+      .run(stamp, actor?.id || 'system', t.id)
     db.prepare(`INSERT INTO approval_steps(task_id,step_no,role,action,actor_id,actor_name,note,acted_at)
                 VALUES(?,?,?,?,?,?,?,?)`)
       .run(t.id, num(t.current_step), actor?.role || '', 'cancel', actor?.id || '', actor?.name || '',

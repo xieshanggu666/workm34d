@@ -42,6 +42,15 @@ export const useHrStore = defineStore('hr', {
     users: s => s.data?.users || [],
     approvals: s => s.data?.approvals || [],
     notifications: s => s.data?.notifications || [],
+    // 按角色委托 / 超时升级
+    delegations: s => (s.data?.delegations || []).map(d => ({
+      ...d,
+      scope_task_types: Array.isArray(d.scope_task_types)
+        ? (typeof d.scope_task_types === 'string' ? JSON.parse(d.scope_task_types || '[]') : d.scope_task_types)
+        : []
+    })),
+    stepRoutes: s => s.data?.stepRoutes || [],
+    escalationConfig: s => s.data?.escalationConfig || [],
     // 跨角色危机处置审计
     crisisIncidents: s => s.data?.crisisIncidents || [],
     crisisEntries: s => s.data?.crisisEntries || [],
@@ -63,17 +72,49 @@ export const useHrStore = defineStore('hr', {
     currentUser(s) { return (s.data?.users || []).find(u => u.id === s.userId) || null },
     myRole() { return this.currentUser?.role || 'recruiter' },
     myNotifications() {
-      return this.notifications.filter(n => n.recipient_role === this.myRole)
+      // 定向到本人（代理人/升级人个人待办，可能跨角色）或本角色的广播通知
+      return this.notifications.filter(n =>
+        n.recipient_user_id === this.userId ||
+        (!n.recipient_user_id && n.recipient_role === this.myRole))
     },
     unreadCount() { return this.myNotifications.filter(n => !n.is_read).length },
     // 某应聘是否存在进行中的审批（可选指定类型）：看板/面试/Offer 页用来显示「审批中」并禁止重复提请
     pendingTask: s => (appId, type) =>
       (s.data?.approvals || []).find(t => t.application_id === appId && t.status === 'pending' && (!type || t.type === type)) || null,
-    // 待当前角色审批的任务数（审批中心红点）
+    // 某任务当前等待节点上定向给本人的有效路由（委托代理/超时升级）
+    myRouteOnTask() {
+      return t => {
+        if (t.status !== 'pending' || !Array.isArray(t.routes)) return null
+        return t.routes.find(r =>
+          r.status === 'active' && r.step_no === t.current_step && r.actor_user_id === this.userId) || null
+      }
+    },
+    // 当前身份是否可「以本人或代理人身份」发起某类审批
+    canSubmitTask() {
+      return type => {
+        const submitRole = {
+          stage_advance: 'recruiter', offer_issue: 'recruiter',
+          strategy_publish: 'recruiter', interview_conclusion: 'interviewer'
+        }[type]
+        if (!submitRole) return false
+        if (this.myRole === submitRole) return true
+        const at = new Date().toISOString()
+        return this.delegations.some(d =>
+          d.status === 'active' &&
+          d.grantee_id === this.userId &&
+          d.granter_role === submitRole &&
+          (!d.scope_task_types?.length || d.scope_task_types.includes(type)) &&
+          (!d.starts_at || at >= d.starts_at) &&
+          (!d.ends_at || at <= d.ends_at))
+      }
+    },
+    // 待当前身份审批的任务数（本角色节点 + 代理/升级路由，审批中心红点）
     todoCount() {
-      return this.approvals.filter(t =>
-        t.status === 'pending' && t.chain[t.current_step]?.role === this.myRole
-      ).length
+      return this.approvals.filter(t => {
+        if (t.status !== 'pending') return false
+        if (t.chain[t.current_step]?.role === this.myRole) return true
+        return !!this.myRouteOnTask(t)
+      }).length
     },
     // 预约协商待办：面试官=待本人确认/改期确认的预约；招聘负责人=待候选人确认 + 系统初判缺席待裁定
     scheduleTodoCount() {
@@ -238,6 +279,22 @@ export const useHrStore = defineStore('hr', {
     cancelApproval(id) {
       return this.runBusy(`appr:${id}`, () =>
         this.api('POST', `/approvals/${id}/cancel`, {}, { success: '申请已撤销' }))
+    },
+    // ---------------- 按角色委托 / 超时升级 ----------------
+    revokeDelegation(id, reason) {
+      return this.runBusy(`deleg-revoke:${id}`, () =>
+        this.api('POST', `/delegations/${id}/revoke`, { reason: reason || '' }, { success: '委托已撤销，在途代理权限即时收回' }))
+    },
+    async sweepApprovals() {
+      try {
+        const r = await j('GET', '/delegations/sweep')
+        await this.refresh()
+        return r
+      } catch (e) { this.notify('error', e.message); return null }
+    },
+    updateEscalationConfig(role, payload) {
+      return this.runBusy(`escalation:${role}`, () =>
+        this.api('POST', `/escalation-config/${role}`, payload, { success: '超时升级配置已保存' }))
     },
     markNotificationsRead(ids) {
       return this.api('POST', '/notifications/read', ids?.length ? { ids } : {})

@@ -479,6 +479,71 @@ CREATE TABLE IF NOT EXISTS schedule_risk_events (
 CREATE INDEX IF NOT EXISTS idx_risk_app ON schedule_risk_events(application_id, kind, status);
 CREATE INDEX IF NOT EXISTS idx_risk_appt ON schedule_risk_events(appointment_id, id);
 
+-- ---------------- 按角色委托与超时升级 ----------------
+-- 角色委托：某审批角色的持有人（granter）把该角色的审批权在时间窗 + 审批类型范围内委托给异角色成员；
+-- 委托期间本人与代理人并行有权，撤销后未处理的代理路由立即失效（已代理完成的决策只留痕不回滚）
+CREATE TABLE IF NOT EXISTS delegations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  granter_role TEXT NOT NULL,             -- 被代理的审批角色 recruiter/interviewer/hiring_manager
+  granter_id TEXT NOT NULL DEFAULT '',    -- 设立委托的角色持有人 users.id
+  granter_name TEXT NOT NULL DEFAULT '',
+  grantee_id TEXT NOT NULL,              -- 代理人 users.id（必须为其他角色）
+  grantee_name TEXT NOT NULL DEFAULT '',
+  scope_task_types TEXT NOT NULL DEFAULT '[]', -- 授权审批类型 JSON；[]=全部四类审批
+  reason TEXT NOT NULL DEFAULT '',        -- 委托事由（必填留痕）
+  status TEXT NOT NULL DEFAULT 'active',  -- scheduled(待生效)/active/revoked(撤销)/expired(窗口到期)
+  starts_at TEXT NOT NULL DEFAULT '',     -- ISO；空=立即生效
+  ends_at TEXT NOT NULL DEFAULT '',       -- ISO；空=长期有效
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  revoked_by TEXT NOT NULL DEFAULT '',
+  revoked_at TEXT NOT NULL DEFAULT '',
+  revoke_reason TEXT NOT NULL DEFAULT ''
+);
+-- 同一代理人对同一审批角色同时只能持有一份有效（含待生效、不含已过期/撤销）委托，防止并发授权交叉
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deleg_active_once
+  ON delegations(grantee_id, granter_role) WHERE status IN ('active','scheduled');
+CREATE INDEX IF NOT EXISTS idx_deleg_role ON delegations(granter_role, status);
+
+-- 审批步骤路由：审批链快照（approval_tasks.chain）只固化角色，具体在哪个节点由谁代理/升级在此追加，
+-- 不回写 chain；同一任务×步骤最多一条 active 路由，代理人/升级人处理后 consumed，撤销/取消后 superseded
+CREATE TABLE IF NOT EXISTS approval_step_routes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  step_no INTEGER NOT NULL,               -- 对应 chain 下标
+  kind TEXT NOT NULL,                     -- delegation=按角色委托 / escalation=超时升级
+  delegation_id INTEGER NOT NULL DEFAULT 0,
+  role TEXT NOT NULL DEFAULT '',          -- 该节点的原始审批角色
+  actor_user_id TEXT NOT NULL,            -- 被授权实际处理人 users.id
+  actor_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',  -- active/consumed/superseded
+  note TEXT NOT NULL DEFAULT '',
+  sla_hours REAL NOT NULL DEFAULT 0,      -- 升级时该节点实际超时阈值（小时）
+  due_at TEXT NOT NULL DEFAULT '',        -- 升级时该节点的截止时间（审计证据）
+  created_at TEXT NOT NULL DEFAULT '',
+  consumed_at TEXT NOT NULL DEFAULT '',
+  consumed_by TEXT NOT NULL DEFAULT '',
+  superseded_at TEXT NOT NULL DEFAULT '',
+  superseded_by TEXT NOT NULL DEFAULT ''
+);
+-- 同一任务×步骤×授权人最多一条 active 路由（代理人与升级人可并行；任一处理后全部 consumed）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_step_route_active_once
+  ON approval_step_routes(task_id, step_no, kind, actor_user_id) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_step_route_actor ON approval_step_routes(actor_user_id, status);
+
+-- 超时升级配置：按审批节点角色配置 SLA（小时，0=立即超时）与升级目标角色/指定人
+CREATE TABLE IF NOT EXISTS escalation_config (
+  role TEXT PRIMARY KEY,
+  sla_hours REAL NOT NULL DEFAULT 48,
+  target_role TEXT NOT NULL DEFAULT '',
+  target_user_id TEXT NOT NULL DEFAULT '',
+  updated_by TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT ''
+);
+INSERT OR IGNORE INTO escalation_config(role,sla_hours,target_role,updated_by,updated_at) VALUES
+  ('hiring_manager', 48, 'recruiter', 'system', ''),
+  ('recruiter', 24, 'hiring_manager', 'system', '');
+
 -- 不可篡改兜底：危机审计链拒绝 UPDATE / DELETE（应用层哈希校验 + 数据库触发器双重保护）
 CREATE TRIGGER IF NOT EXISTS trg_crisis_entries_no_update
 BEFORE UPDATE ON crisis_audit_entries
@@ -557,6 +622,24 @@ addColumn('notifications', 'incident_id', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('notifications', 'ticket_id', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('notifications', 'owner_name', `TEXT NOT NULL DEFAULT ''`)
 addColumn('notifications', 'owner_user_id', `TEXT NOT NULL DEFAULT ''`)
+
+// 按角色委托 / 超时升级（旧库升级）
+// 通知定向到人：recipient_user_id 非空=仅该用户待办（代理人/升级人），为空=按 recipient_role 角色广播
+addColumn('notifications', 'recipient_user_id', `TEXT NOT NULL DEFAULT ''`)
+addColumn('notifications', 'delegation_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('notifications', 'step_no', `INTEGER NOT NULL DEFAULT -1`)
+addColumn('approval_tasks', 'step_due_at', `TEXT NOT NULL DEFAULT ''`) // 当前节点超时截止（ISO）；空=无超时
+addColumn('approval_tasks', 'submit_delegation_id', `INTEGER NOT NULL DEFAULT 0`) // 经委托代理发起时的委托单
+
+// 步骤路由唯一索引升级：旧版按 (task_id,step_no) 唯一（委托与升级无法并行），重建为按授权人维度
+{
+  const idx = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_step_route_active_once'").get()
+  if (idx && !idx.sql.includes('actor_user_id')) {
+    db.exec('DROP INDEX idx_step_route_active_once')
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_step_route_active_once
+      ON approval_step_routes(task_id, step_no, kind, actor_user_id) WHERE status='active'`)
+  }
+}
 
 // 旧库索引迁移：正式事件改为「每个 application×stage 仅保留最新一条」（部分唯一索引）
 const evIndexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='application_events'").all().map(i => i.name)
@@ -691,13 +774,13 @@ seed()
 
 // 内置三类角色用户：招聘负责人 / 面试官 / 用人经理（演示环境固定账号，前端顶栏可切换身份）
 function seedUsers() {
-  const n = db.prepare('SELECT COUNT(*) c FROM users').get().c
-  if (n > 0) return
-  const iU = db.prepare('INSERT INTO users(id,name,role,title) VALUES(?,?,?,?)')
+  const iU = db.prepare('INSERT OR IGNORE INTO users(id,name,role,title) VALUES(?,?,?,?)')
+  // 同角色后备账号用于演示「超时升级到指定人」；异角色成员演示「按角色委托」
   ;[
     ['u-sandy', 'Sandy 陈', 'recruiter', '招聘负责人'],
     ['u-li', '李工', 'interviewer', '面试官'],
-    ['u-wang', '王经理', 'hiring_manager', '用人经理']
+    ['u-wang', '王经理', 'hiring_manager', '用人经理'],
+    ['u-zhao', '赵总（HRBP）', 'recruiter', '招聘负责人·后备审批人']
   ].forEach(u => iU.run(...u))
 }
 seedUsers()

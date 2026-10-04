@@ -13,7 +13,7 @@ const depts = ['技术部', '产品部', '设计部', '数据部', '质量部', 
 const cities = ['北京', '上海', '深圳', '杭州', '广州', '成都', '武汉', '南京']
 
 const appCount = pid => store.applications.filter(a => a.position_id === pid).length
-const canGovern = computed(() => store.myRole === 'recruiter')
+const canGovern = computed(() => store.canSubmitTask('strategy_publish'))
 
 // ---------------- 按职位匹配策略 ----------------
 const DIM_META = [

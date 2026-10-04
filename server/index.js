@@ -8,6 +8,11 @@ import { router as scheduleRouter, getScheduleState } from './schedule.js'
 import {
   bindScheduleCore, assertNoOpenCandidateNoshow, migrateScheduleRisk
 } from './schedule-risk.js'
+import {
+  router as delegationRouter,
+  findActiveDelegationForUser, resolveStepAuthority, consumeActiveRoutes,
+  rearmStep, markTaskUnreadRead, sweepTimeouts, getDelegationState
+} from './delegation.js'
 
 const app = express()
 app.use(express.json())
@@ -110,11 +115,21 @@ function addStep(taskId, { stepNo = -1, role = '', action, actor, note = '' }) {
     .run(taskId, stepNo, role, action, actor?.id || '', actor?.name || actor || '', note, ts())
 }
 
+// 撤销通知投递到任务当前等待节点角色（任务行快照解析，供事务内复用）
+function chainRoleOf(t) {
+  const chain = parseJSON(t.chain, [])
+  return chain[num(t.current_step)]?.role || ''
+}
+
 // 审计通知：按接收角色投递，审批中心与顶栏铃铛共用同一数据源
-function notify({ recipientRole, type, title, body, taskId = 0, appId = 0 }) {
-  db.prepare(`INSERT INTO notifications(recipient_role,type,title,body,task_id,application_id,is_read,created_at)
-              VALUES(?,?,?,?,?,?,0,?)`)
-    .run(recipientRole, type, title, body, taskId, appId, ts())
+// recipientUserId 非空=定向到具体用户（代理人/升级人个人待办），为空=按角色广播
+function notify({ recipientRole, recipientUserId = '', type, title, body, taskId = 0, appId = 0,
+  delegationId = 0, stepNo = -1 }) {
+  db.prepare(`INSERT INTO notifications
+    (recipient_role,recipient_user_id,delegation_id,step_no,type,title,body,task_id,application_id,is_read,created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,0,?)`)
+    .run(recipientRole, recipientUserId, num(delegationId), num(stepNo), type, title, body,
+      num(taskId), num(appId), ts())
 }
 
 // 乐观锁：阶段协同类操作必须携带读取时的 version；并发/重复点击导致版本错位时拒绝
@@ -557,6 +572,8 @@ app.get('/api/state', (req, res) => {
   // 审批中心数据：任务 + 提交时固化的审批链 + 全程步骤留痕；通知按角色投递
   const users = db.prepare('SELECT * FROM users ORDER BY rowid').all()
   const approvalSteps = db.prepare('SELECT * FROM approval_steps ORDER BY id ASC').all()
+  const approvalRoutes = db.prepare('SELECT * FROM approval_step_routes ORDER BY id ASC').all()
+    .map(r => ({ ...r, delegation_id: num(r.delegation_id), step_no: num(r.step_no), sla_hours: num(r.sla_hours) }))
   const approvals = db.prepare('SELECT * FROM approval_tasks ORDER BY id DESC').all().map(t => {
     const a = apps.find(x => x.id === t.application_id)
     const payload0 = parseJSON(t.payload, {})
@@ -568,6 +585,7 @@ app.get('/api/state', (req, res) => {
       payload: parseJSON(t.payload, {}),
       chain: parseJSON(t.chain, []),
       steps: approvalSteps.filter(s => s.task_id === t.id),
+      routes: approvalRoutes.filter(r => r.task_id === t.id),
       candidate: cand ? cand.name : '',
       position: pos ? pos.name : '',
       dept: pos ? pos.dept : '',
@@ -576,7 +594,7 @@ app.get('/api/state', (req, res) => {
     }
   })
   const notifications = db.prepare('SELECT * FROM notifications ORDER BY id DESC LIMIT 300').all()
-    .map(n => ({ ...n, is_read: !!n.is_read }))
+    .map(n => ({ ...n, is_read: !!n.is_read, delegation_id: num(n.delegation_id), step_no: num(n.step_no) }))
   const latestItemOf = (cid, pid) => db.prepare(`SELECT ri.* FROM recalc_items ri
     WHERE ri.candidate_id=? AND ri.position_id=? ORDER BY ri.id DESC LIMIT 1`).get(cid, pid) || null
   const matchOf = (cid, pid) => matches.find(m => m.candidate_id === cid && m.position_id === pid) || null
@@ -617,7 +635,8 @@ app.get('/api/state', (req, res) => {
     strategyVersions, recalcJobs, recalcItems, users, approvals, notifications,
     defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP },
     ...getCrisisState(),
-    ...getScheduleState()
+    ...getScheduleState(),
+    ...getDelegationState()
   })
 })
 
@@ -778,10 +797,13 @@ app.post('/api/positions/:id/strategy', (req, res, next) => {
   const id = num(req.params.id)
   const b = req.body || {}
   try {
-    if (user.role !== 'recruiter') forbidden('匹配策略发布需由招聘负责人发起', 'role_not_allowed')
     if (!db.prepare('SELECT id FROM positions WHERE id=?').get(id)) return res.status(404).json({ ok: false })
     const payload = parseStrategyPayload(b)
     const result = tx(() => {
+      const submitDeleg = user.role === 'recruiter' ? null : findActiveDelegationForUser(user.id, 'strategy_publish')
+      if (user.role !== 'recruiter' && !(submitDeleg && submitDeleg.granter_role === 'recruiter')) {
+        forbidden('匹配策略发布需由招聘负责人（或其有效代理人）发起', 'role_not_allowed')
+      }
       assertNoStrategyGovernanceLock(id)
       const baseline = getStrategy(id)
       const stamp = ts()
@@ -807,20 +829,23 @@ app.post('/api/positions/:id/strategy', (req, res, next) => {
       }
       const chain = buildChain('strategy_publish', approvalPayload, null)
       const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(id)
-      const tr = db.prepare(`INSERT INTO approval_tasks(type,application_id,interview_id,offer_id,payload,chain,current_step,status,submitted_by,submitted_by_name,submitted_role,submitted_at,version)
-                             VALUES('strategy_publish',0,0,0,?,?,0,'pending',?,?,?,?,1)`)
-        .run(JSON.stringify(approvalPayload), JSON.stringify(chain), user.id, user.name, user.role, stamp)
+      const tr = db.prepare(`INSERT INTO approval_tasks(type,application_id,interview_id,offer_id,payload,chain,current_step,status,submitted_by,submitted_by_name,submitted_role,submitted_at,version,submit_delegation_id)
+                             VALUES('strategy_publish',0,0,0,?,?,0,'pending',?,?,?,?,1,?)`)
+        .run(JSON.stringify(approvalPayload), JSON.stringify(chain), user.id, user.name,
+          submitDeleg ? submitDeleg.granter_role : user.role, stamp, submitDeleg ? submitDeleg.id : 0)
       const taskId = Number(tr.lastInsertRowid)
       db.prepare('UPDATE strategy_versions SET approval_task_id=? WHERE id=?').run(taskId, versionId)
       addStep(taskId, {
-        stepNo: -1, role: user.role, action: 'submit', actor: user,
-        note: `提交策略 v${versionId}（${payload.rolloutMode === 'canary' ? `灰度 ${payload.canaryIds.length || payload.canaryPercent + '%'}` : '全量'}）：${payload.changeNote || '无发布说明'}`
+        stepNo: -1, role: submitDeleg ? submitDeleg.granter_role : user.role, action: 'submit', actor: user,
+        note: `${submitDeleg ? `经委托单 #${submitDeleg.id} 代理${ROLE_LABEL.recruiter}发起｜` : ''}提交策略 v${versionId}（${payload.rolloutMode === 'canary' ? `灰度 ${payload.canaryIds.length || payload.canaryPercent + '%'}` : '全量'}）：${payload.changeNote || '无发布说明'}`
       })
+      // 新等待节点：设置超时截止并挂接该角色当前有效委托
+      rearmStep(taskId, 0)
       notify({
         recipientRole: chain[0].role, type: 'task_submitted',
         title: '新的匹配策略发布审批待处理',
         body: `${user.name} 提交「${pos.name}」策略 v${versionId}，请核对生效窗口与灰度范围`,
-        taskId, appId: 0
+        taskId, appId: 0, stepNo: 0
       })
       return { versionId, taskId, chain }
     })
@@ -1614,9 +1639,12 @@ app.post('/api/approvals', (req, res, next) => {
     const out = tx(() => {
       if (!meta) badRequest('未知审批类型', 'unknown_task_type')
       if (type === 'strategy_publish') badRequest('策略发布请使用 /api/positions/:id/strategy 专用入口', 'use_strategy_endpoint')
-      if (user.role !== meta.submitRole) {
-        forbidden(`「${meta.label}」申请需由${ROLE_LABEL[meta.submitRole]}发起，当前身份为「${ROLE_LABEL[user.role]}」`, 'role_not_allowed')
+      // 发起权限：本角色成员或持有该角色有效委托的代理人（撤销后代理发起立即 403）
+      const submitDeleg = user.role === meta.submitRole ? null : findActiveDelegationForUser(user.id, type)
+      if (user.role !== meta.submitRole && !(submitDeleg && submitDeleg.granter_role === meta.submitRole)) {
+        forbidden(`「${meta.label}」申请需由${ROLE_LABEL[meta.submitRole]}（或其有效代理人）发起，当前身份为「${ROLE_LABEL[user.role] || user.role}」`, 'role_not_allowed')
       }
+      const submitRole = submitDeleg ? submitDeleg.granter_role : user.role
       const a = db.prepare('SELECT * FROM applications WHERE id=?').get(num(b.application_id))
       if (!a) return { notFound: true }
       // 同一应聘同一类型只允许一个进行中的审批，防止重复申请
@@ -1666,16 +1694,22 @@ app.post('/api/approvals', (req, res, next) => {
       const chain = buildChain(type, payload, a)
       const cand = db.prepare('SELECT name FROM candidates WHERE id=?').get(a.candidate_id)
       const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(a.position_id)
-      const r = db.prepare(`INSERT INTO approval_tasks(type,application_id,interview_id,payload,chain,current_step,status,submitted_by,submitted_by_name,submitted_role,submitted_at,version)
-                            VALUES(?,?,?,?,?,0,'pending',?,?,?,?,1)`)
-        .run(type, a.id, interviewId, JSON.stringify(payload), JSON.stringify(chain), user.id, user.name, user.role, ts())
+      const r = db.prepare(`INSERT INTO approval_tasks(type,application_id,interview_id,payload,chain,current_step,status,submitted_by,submitted_by_name,submitted_role,submitted_at,version,submit_delegation_id)
+                            VALUES(?,?,?,?,?,0,'pending',?,?,?,?,1,?)`)
+        .run(type, a.id, interviewId, JSON.stringify(payload), JSON.stringify(chain),
+          user.id, user.name, submitRole, ts(), submitDeleg ? submitDeleg.id : 0)
       const taskId = Number(r.lastInsertRowid)
-      addStep(taskId, { stepNo: -1, role: user.role, action: 'submit', actor: user, note: summary })
+      addStep(taskId, {
+        stepNo: -1, role: submitRole, action: 'submit', actor: user,
+        note: `${submitDeleg ? `经委托单 #${submitDeleg.id} 代理${ROLE_LABEL[submitRole]}发起｜` : ''}${summary}`
+      })
+      // 第一等待节点：写超时截止并挂接该角色当前有效的委托路由/定向待办
+      rearmStep(taskId, 0)
       notify({
         recipientRole: chain[0].role, type: 'task_submitted',
         title: `新的${meta.label}审批待处理`,
         body: `${user.name} 提交「${cand?.name || ''} · ${pos?.name || ''}」：${summary}`,
-        taskId, appId: a.id
+        taskId, appId: a.id, stepNo: 0
       })
       return { ok: true, id: taskId, chain }
     })
@@ -1698,9 +1732,23 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
       const chain = parseJSON(t.chain, [])
       const step = chain[t.current_step]
       if (!step) conflict('审批链数据异常', 'chain_broken')
-      if (step.role !== user.role) {
-        forbidden(`当前节点需「${ROLE_LABEL[step.role]}」审批，您的角色为「${ROLE_LABEL[user.role]}」`, 'role_not_allowed')
+      // 节点处理权：原角色本人 / 有效委托的代理人 / 超时升级人；授权在事务内即时解析，撤销后立即无权
+      const authority = resolveStepAuthority(t, user)
+      if (!authority) {
+        forbidden(`当前节点需「${ROLE_LABEL[step.role]}」、其有效代理人或超时升级人处理，您的身份为「${ROLE_LABEL[user.role] || user.role}」`, 'role_not_allowed')
       }
+      // 职责分离：经委托代理发起的人不能再审批同一任务（即便其同时持有升级/代理路由）
+      if (t.submitted_by === user.id && (mode !== 'role' || num(t.submit_delegation_id) > 0)) {
+        forbidden('代理人不能审批自己代理发起的申请', 'submitter_cannot_approve')
+      }
+      const mode = authority.mode
+      // 代理/升级身份在留痕中显式标注；chain 快照不改写，实际处理人写进 actor 与 step 路由
+      const actorTag = mode === 'delegation'
+        ? `代理${ROLE_LABEL[step.role]}（委托单 #${authority.delegation.id}）`
+        : mode === 'escalation'
+          ? `超时升级人（原节点 ${ROLE_LABEL[step.role]}）`
+          : ''
+      const stepRole = step.role // 留痕角色固定为节点原角色，保留审批链快照口径
       const meta = TASK_TYPES[t.type]
       const note = String(b.note || '')
       const payloadNow = parseJSON(t.payload, {})
@@ -1711,33 +1759,45 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
 
       if (b.action === 'return') {
         if (!note.trim()) badRequest('退回必须填写退回意见', 'note_required')
-        db.prepare("UPDATE approval_tasks SET status='returned', decided_at=?, decide_note=?, version=version+1 WHERE id=?")
+        db.prepare("UPDATE approval_tasks SET status='returned', decided_at=?, decide_note=?, step_due_at='', version=version+1 WHERE id=?")
           .run(ts(), note, taskId)
         if (t.type === 'strategy_publish') {
           db.prepare("UPDATE strategy_versions SET status='returned' WHERE id=? AND status='pending'")
             .run(num(payloadNow.strategy_version_id))
         }
-        addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'return', actor: user, note })
+        consumeActiveRoutes(taskId, t.current_step, user)
+        addStep(taskId, { stepNo: t.current_step, role: stepRole, action: 'return', actor: user, note: actorTag ? `${actorTag}｜${note}` : note })
+        // 退回：本节点处理人侧待办与申请人侧待办都失效，归并旧未读后再投新待办
+        markTaskUnreadRead(taskId)
         notify({
-          recipientRole: t.submitted_role, type: 'task_returned',
+          recipientRole: t.submitted_role, recipientUserId: t.submitted_by, type: 'task_returned',
           title: `${meta.label}审批被退回`,
-          body: `${user.name} 退回「${who}」：${note}`,
+          body: `${user.name}${actorTag ? `（${actorTag}）` : ''} 退回「${who}」：${note}`,
           taskId, appId: t.application_id
         })
         return { ok: true, status: 'returned' }
       }
       if (b.action !== 'approve') badRequest('未知审批动作', 'unknown_action')
 
-      addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'approve', actor: user, note })
+      // 任一处理人通过：消费该节点全部 active 路由（关闭其他代理人/升级人的并行授权窗口）
+      consumeActiveRoutes(taskId, t.current_step, user)
+      addStep(taskId, {
+        stepNo: t.current_step, role: stepRole, action: 'approve', actor: user,
+        note: actorTag ? `${actorTag}${note ? `｜${note}` : ''}` : note
+      })
       if (t.current_step + 1 < chain.length) {
         // 中间级通过：流转下一节点并通知下一审批人
-        const nextStep = chain[t.current_step + 1]
+        const oldStep = num(t.current_step)
+        const nextStep = chain[oldStep + 1]
         db.prepare('UPDATE approval_tasks SET current_step=current_step+1, version=version+1 WHERE id=?').run(taskId)
+        // 仅归并旧节点处理人侧未读待办（升级人/代理人定向通知）；下一节点的新待办不受影响
+        markTaskUnreadRead(taskId, { audience: true, stepNo: oldStep })
+        rearmStep(taskId, oldStep + 1)
         notify({
           recipientRole: nextStep.role, type: 'task_submitted',
           title: `${meta.label}审批流转至您`,
-          body: `「${who}」已由 ${user.name} 初审通过，待您终审`,
-          taskId, appId: t.application_id
+          body: `「${who}」已由 ${user.name}${actorTag ? `（${actorTag}）` : ''} 初审通过，待您终审`,
+          taskId, appId: t.application_id, stepNo: oldStep + 1
         })
         return { ok: true, status: 'pending', next: nextStep.role }
       }
@@ -1757,41 +1817,44 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
       }
       const stamp = ts()
       if (execErr) {
-        db.prepare("UPDATE approval_tasks SET status='failed', decided_at=?, decide_note=?, result_note=?, version=version+1 WHERE id=?")
+        db.prepare("UPDATE approval_tasks SET status='failed', decided_at=?, decide_note=?, result_note=?, step_due_at='', version=version+1 WHERE id=?")
           .run(stamp, note, execErr.message, taskId)
         if (t.type === 'strategy_publish') {
           db.prepare("UPDATE strategy_versions SET status='failed' WHERE id=? AND status='pending'")
             .run(num(payloadNow.strategy_version_id))
         }
-        addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'failed', actor: user, note: `审批通过但执行失败：${execErr.message}` })
+        addStep(taskId, { stepNo: t.current_step, role: stepRole, action: 'failed', actor: user, note: `审批通过但执行失败：${execErr.message}${actorTag ? `（${actorTag}）` : ''}` })
         // 危机事件关联的应聘：审批回写失败也是关键处置事件，上链留痕
         auditPassive({
           category: 'decision', action: 'approval.failed', actor: user, applicationId: t.application_id,
           refType: 'approval', refId: taskId,
           summary: `${meta.label}审批通过但执行回写失败：${execErr.message}`,
-          detail: { task_id: taskId, type: t.type, error_code: execErr.code, error: execErr.message }
+          detail: { task_id: taskId, type: t.type, authority: mode, actor_id: user.id, error_code: execErr.code, error: execErr.message }
         })
+        markTaskUnreadRead(taskId)
         notify({
-          recipientRole: t.submitted_role, type: 'task_failed',
+          recipientRole: t.submitted_role, recipientUserId: t.submitted_by, type: 'task_failed',
           title: `${meta.label}审批执行失败`,
           body: `「${who}」审批已通过，但回写失败：${execErr.message}`,
           taskId, appId: t.application_id
         })
         return { ok: true, status: 'failed', msg: execErr.message }
       }
-      db.prepare("UPDATE approval_tasks SET status='approved', decided_at=?, decide_note=?, result_note=?, version=version+1 WHERE id=?")
+      db.prepare("UPDATE approval_tasks SET status='approved', decided_at=?, decide_note=?, result_note=?, step_due_at='', version=version+1 WHERE id=?")
         .run(stamp, note, execDesc, taskId)
-      addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'execute', actor: user, note: execDesc })
+      addStep(taskId, { stepNo: t.current_step, role: stepRole, action: 'execute', actor: user, note: actorTag ? `${execDesc}（${actorTag}）` : execDesc })
       auditPassive({
         category: 'decision', action: 'approval.execute', actor: user, applicationId: t.application_id,
         refType: 'approval', refId: taskId,
         summary: `${meta.label}终审通过并执行回写：${execDesc}`,
-        detail: { task_id: taskId, type: t.type, payload: parseJSON(t.payload, {}), result: execDesc }
+        detail: { task_id: taskId, type: t.type, authority: mode, actor_id: user.id, payload: parseJSON(t.payload, {}), result: execDesc }
       })
+      // 终审结案：处理人侧 + 申请人侧全部未读待办归并后再发生效通知，铃铛无残留
+      markTaskUnreadRead(taskId)
       notify({
-        recipientRole: t.submitted_role, type: 'task_executed',
+        recipientRole: t.submitted_role, recipientUserId: t.submitted_by, type: 'task_executed',
         title: `${meta.label}审批通过已生效`,
-        body: `「${who}」${execDesc}（终审：${user.name}）`,
+        body: `「${who}」${execDesc}（终审：${user.name}${actorTag ? `，${actorTag}` : ''}）`,
         taskId, appId: t.application_id
       })
       return { ok: true, status: 'approved', desc: execDesc }
@@ -1869,9 +1932,14 @@ app.post('/api/approvals/:id/resubmit', (req, res, next) => {
         summary = '重新提交推进申请'
       }
       const chain = buildChain(t.type, payload, a)
-      db.prepare("UPDATE approval_tasks SET payload=?, chain=?, current_step=0, status='pending', submitted_at=?, decide_note='', version=version+1 WHERE id=?")
+      // 重提：作废旧节点遗留路由（含超时升级），重置到第一节点并重排超时/委托
+      db.prepare("UPDATE approval_step_routes SET status='superseded', superseded_at=?, superseded_by=? WHERE task_id=? AND status='active'")
+        .run(ts(), user.id, taskId)
+      db.prepare("UPDATE approval_tasks SET payload=?, chain=?, current_step=0, status='pending', submitted_at=?, decided_at='', decide_note='', version=version+1 WHERE id=?")
         .run(JSON.stringify(payload), JSON.stringify(chain), ts(), taskId)
-      addStep(taskId, { stepNo: -1, role: user.role, action: 'resubmit', actor: user, note: summary })
+      addStep(taskId, { stepNo: -1, role: t.submitted_role, action: 'resubmit', actor: user, note: summary })
+      markTaskUnreadRead(taskId)
+      rearmStep(taskId, 0)
       const cand = a && db.prepare('SELECT name FROM candidates WHERE id=?').get(a.candidate_id)
       const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(a ? a.position_id : num(payload.position_id))
       const targetName = a ? `${cand?.name || ''} · ${pos?.name || ''}` : `${pos?.name || ''} 策略 v${payload.strategy_version_id}`
@@ -1879,7 +1947,7 @@ app.post('/api/approvals/:id/resubmit', (req, res, next) => {
         recipientRole: chain[0].role, type: 'task_resubmitted',
         title: `${meta.label}申请已修改重提`,
         body: `${user.name} 重新提交「${targetName}」：${summary}`,
-        taskId, appId: a ? a.id : 0
+        taskId, appId: a ? a.id : 0, stepNo: 0
       })
       return { ok: true, status: 'pending', chain }
     })
@@ -1898,19 +1966,23 @@ app.post('/api/approvals/:id/cancel', (req, res, next) => {
       if (!t) return { notFound: true }
       if (t.status !== 'pending' && t.status !== 'returned') conflict('该任务已结案，无法撤销', 'task_closed')
       if (t.submitted_by !== user.id) forbidden('仅原申请人可以撤销该任务', 'not_submitter')
-      db.prepare("UPDATE approval_tasks SET status='cancelled', decided_at=?, version=version+1 WHERE id=?").run(ts(), taskId)
+      db.prepare("UPDATE approval_tasks SET status='cancelled', decided_at=?, step_due_at='', version=version+1 WHERE id=?").run(ts(), taskId)
+      // 作废全部未消费的委托/升级路由，代理人/升级人不再能处理该任务
+      db.prepare("UPDATE approval_step_routes SET status='superseded', superseded_at=?, superseded_by=? WHERE task_id=? AND status='active'")
+        .run(ts(), user.id, taskId)
       if (t.type === 'strategy_publish') {
         const payload = parseJSON(t.payload, {})
         db.prepare("UPDATE strategy_versions SET status='cancelled' WHERE id=? AND status IN ('pending','returned')")
           .run(num(payload.strategy_version_id))
       }
-      addStep(taskId, { stepNo: -1, role: user.role, action: 'cancel', actor: user, note: String(req.body?.note || '') })
+      addStep(taskId, { stepNo: -1, role: t.submitted_role, action: 'cancel', actor: user, note: String(req.body?.note || '') })
+      // 撤销：处理人侧（含代理人/升级人定向通知）与申请人侧未读待办全部归并
+      markTaskUnreadRead(taskId)
       if (t.status === 'pending') {
-        const chain = parseJSON(t.chain, [])
         const meta = TASK_TYPES[t.type]
         const payload = parseJSON(t.payload, {})
         notify({
-          recipientRole: chain[t.current_step]?.role || '', type: 'task_cancelled',
+          recipientRole: chainRoleOf(t), type: 'task_cancelled',
           title: `${meta?.label || '审批'}申请已撤销`,
           body: `${user.name} 撤销了「${meta?.label || ''}」申请 #${taskId}${payload.strategy_version_id ? `（v${payload.strategy_version_id}）` : ''}`,
           taskId, appId: t.application_id
@@ -1923,15 +1995,19 @@ app.post('/api/approvals/:id/cancel', (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// 通知已读：默认把当前身份角色的未读全部标记；也可传 ids 精准标记
+// 通知已读：默认把当前身份的未读全部标记（角色广播 + 定向到本人）；也可传 ids 精准标记
 app.post('/api/notifications/read', (req, res) => {
   const user = currentUser(req)
   const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(num).filter(Boolean) : []
   if (ids.length) {
     const marks = ids.map(() => '?').join(',')
-    db.prepare(`UPDATE notifications SET is_read=1 WHERE recipient_role=? AND id IN (${marks})`).run(user.role, ...ids)
+    db.prepare(`UPDATE notifications SET is_read=1
+                WHERE (recipient_role=? AND recipient_user_id='' OR recipient_user_id=?)
+                  AND id IN (${marks})`).run(user.role, user.id, ...ids)
   } else {
-    db.prepare('UPDATE notifications SET is_read=1 WHERE recipient_role=? AND is_read=0').run(user.role)
+    db.prepare(`UPDATE notifications SET is_read=1 WHERE is_read=0
+                AND ((recipient_role=? AND recipient_user_id='') OR recipient_user_id=?)`)
+      .run(user.role, user.id)
   }
   res.json({ ok: true })
 })
@@ -2040,6 +2116,12 @@ try {
 } catch (e) {
   console.error('[HR] strategy window sweep failed:', e)
 }
+try {
+  const r = sweepTimeouts()
+  if (r.count) console.log(`[HR] delegation/escalation sweep: ${r.delegations.length} activated, ${r.expired.length} expired, ${r.escalations.length} escalated`)
+} catch (e) {
+  console.error('[HR] delegation/escalation sweep failed:', e)
+}
 
 // 挂载跨角色危机处置审计模块（路由 + 哈希链 + 责任回写），并注入主流程回退执行器
 bindCrisisCore({ rollbackForIncident })
@@ -2052,6 +2134,8 @@ bindScheduleCore({
   findActiveIncident: findActiveIncidentForApp
 })
 app.use('/api/schedule', scheduleRouter)
+// 按角色委托 / 超时升级（委托 CRUD、超时扫描、升级配置）
+app.use('/api', delegationRouter)
 
 // 统一业务错误出口：ApiError 携带状态码与错误码，其余错误按 500 返回
 // eslint-disable-next-line no-unused-vars
