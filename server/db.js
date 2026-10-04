@@ -278,6 +278,45 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE INDEX IF NOT EXISTS idx_notifications_role ON notifications(recipient_role, is_read, id);
 CREATE INDEX IF NOT EXISTS idx_notifications_incident ON notifications(incident_id, id);
 
+-- ---------------- 按角色审批委托 ----------------
+-- 委托人把本人角色在指定审批类型上的审批权临时授予代理人；可限定适用应聘范围与到期时间。
+-- 撤销/到期后代理人立即失去在途任务的处理权，其个人待办通知在同一事务内归并已读。
+CREATE TABLE IF NOT EXISTS approval_delegations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  delegator_id TEXT NOT NULL,             -- 委托人 users.id（本人角色须 = role）
+  delegator_name TEXT NOT NULL DEFAULT '',
+  delegatee_id TEXT NOT NULL,             -- 代理人 users.id（可为任意角色）
+  delegatee_name TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL,                     -- 被代理的审批节点角色
+  task_types TEXT NOT NULL DEFAULT '[]',  -- 适用审批类型 JSON：stage_advance/interview_conclusion/offer_issue
+  scope TEXT NOT NULL DEFAULT 'all',      -- all=该类型全部在途任务 / applications=仅指定应聘
+  application_ids TEXT NOT NULL DEFAULT '[]',
+  note TEXT NOT NULL DEFAULT '',          -- 委托事由（必填留痕）
+  status TEXT NOT NULL DEFAULT 'active',  -- active/revoked/expired
+  expires_at TEXT NOT NULL DEFAULT '',    -- ISO 到期时间，空=长期有效（撤销前一直有效）
+  created_at TEXT NOT NULL DEFAULT '',
+  revoked_at TEXT NOT NULL DEFAULT '',
+  revoke_note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_delegations_delegatee ON approval_delegations(delegatee_id, status);
+CREATE INDEX IF NOT EXISTS idx_delegations_delegator ON approval_delegations(delegator_id, id);
+CREATE INDEX IF NOT EXISTS idx_delegations_role ON approval_delegations(role, status);
+
+-- ---------------- 审批超时升级规则（按 审批类型×节点角色 配置 SLA） ----------------
+-- 规则在任务提交/重提/升级产生新节点时快照进审批链（chain[].sla），改规则不影响已在途节点；
+-- 超时后系统在链尾追加升级节点（原节点保留），审批链快照完整可审计，且做防环检查。
+CREATE TABLE IF NOT EXISTS approval_escalation_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_type TEXT NOT NULL,                -- stage_advance/interview_conclusion/offer_issue
+  role TEXT NOT NULL,                     -- 超时的审批节点角色
+  timeout_hours REAL NOT NULL DEFAULT 24, -- SLA 时限（小时，支持小数，便于演示）
+  escalate_to TEXT NOT NULL DEFAULT '',   -- 升级目标角色
+  enabled INTEGER NOT NULL DEFAULT 1,
+  updated_by TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  UNIQUE(task_type, role)
+);
+
 -- ---------------- 跨角色危机处置审计模块 ----------------
 -- 危机事件：立案后由指挥官（commander）承担跨角色处置责任，可关联一条在途应聘
 CREATE TABLE IF NOT EXISTS crisis_incidents (
@@ -557,6 +596,14 @@ addColumn('notifications', 'incident_id', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('notifications', 'ticket_id', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('notifications', 'owner_name', `TEXT NOT NULL DEFAULT ''`)
 addColumn('notifications', 'owner_user_id', `TEXT NOT NULL DEFAULT ''`)
+// 按角色委托/超时升级：个人收件人（空=按角色桶投递，非空=仅该用户可见，如代理人/升级对象）
+addColumn('notifications', 'recipient_id', `TEXT NOT NULL DEFAULT ''`)
+addColumn('notifications', 'delegation_id', `INTEGER NOT NULL DEFAULT 0`)
+db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(recipient_id, is_read, id)')
+// 审批留痕补充：代理审批时记录所依据的委托；升级/委托/撤销等节点动作与普通通过同表留痕
+// via: direct/delegate/escalated
+addColumn('approval_steps', 'via', `TEXT NOT NULL DEFAULT ''`)
+addColumn('approval_steps', 'delegation_id', `INTEGER NOT NULL DEFAULT 0`)
 
 // 旧库索引迁移：正式事件改为「每个 application×stage 仅保留最新一条」（部分唯一索引）
 const evIndexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='application_events'").all().map(i => i.name)
@@ -690,17 +737,36 @@ function seed() {
 seed()
 
 // 内置三类角色用户：招聘负责人 / 面试官 / 用人经理（演示环境固定账号，前端顶栏可切换身份）
+// 另设招聘总监：超时升级的兜底审批人（offer_issue 终审加签节点也升级到该角色）
 function seedUsers() {
-  const n = db.prepare('SELECT COUNT(*) c FROM users').get().c
-  if (n > 0) return
   const iU = db.prepare('INSERT INTO users(id,name,role,title) VALUES(?,?,?,?)')
   ;[
     ['u-sandy', 'Sandy 陈', 'recruiter', '招聘负责人'],
     ['u-li', '李工', 'interviewer', '面试官'],
     ['u-wang', '王经理', 'hiring_manager', '用人经理']
-  ].forEach(u => iU.run(...u))
+  ].forEach(u => {
+    if (!db.prepare('SELECT id FROM users WHERE id=?').get(u[0])) iU.run(...u)
+  })
+  if (!db.prepare("SELECT id FROM users WHERE id='u-zhao'").get()) {
+    iU.run('u-zhao', '赵总监', 'hr_director', '招聘总监')
+  }
 }
 seedUsers()
+
+// 默认超时升级规则（仅三类关键审批；只在规则表为空时播种，管理员可在审批中心调整）
+function seedEscalationRules() {
+  const n = db.prepare('SELECT COUNT(*) c FROM approval_escalation_rules').get().c
+  if (n > 0) return
+  const iR = db.prepare(`INSERT INTO approval_escalation_rules(task_type,role,timeout_hours,escalate_to,enabled,updated_by,updated_at)
+                        VALUES(?,?,?,?,1,'system',?)`)
+  ;[
+    ['stage_advance', 'hiring_manager', 24, 'hr_director'],
+    ['interview_conclusion', 'recruiter', 12, 'hr_director'],
+    ['offer_issue', 'hiring_manager', 24, 'hr_director'],
+    ['offer_issue', 'recruiter', 12, 'hr_director']
+  ].forEach(r => iR.run(...r, ts()))
+}
+seedEscalationRules()
 
 // ---------------- 预约模块演示数据（仅空表时播种，复用既有应聘与面试官） ----------------
 // 生成今天起 offset 天的 ISO 时间（HH:MM 本地时刻），保证演示时段始终在当前时间前后可交互

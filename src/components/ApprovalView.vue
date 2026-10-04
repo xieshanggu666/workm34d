@@ -16,6 +16,13 @@ const resubmitStrategy = ref({
 })
 const expandSteps = ref({})      // taskId -> bool 展开审批记录
 
+// 委托管理
+const showDelegate = ref(false)
+const dlg = ref({ role: '', delegatee_id: '', task_types: [], scope: 'all', application_ids: [], note: '', expires_at: '' })
+// 超时升级规则编辑（本地草稿，保存时整体提交）
+const showRules = ref(false)
+const rulesDraft = ref([])
+
 const STAGE_LABEL = { submitted: '投递', screening: '筛选', interview: '面试', offer: 'Offer', hired: '录用', rejected: '淘汰' }
 const TYPE_META = {
   stage_advance: { icon: '🔄', label: '候选人推进', submitRole: 'recruiter' },
@@ -23,6 +30,9 @@ const TYPE_META = {
   offer_issue: { icon: '📄', label: 'Offer 发放', submitRole: 'recruiter' },
   strategy_publish: { icon: '⚙️', label: '匹配策略发布', submitRole: 'recruiter' }
 }
+// 仅三类关键动作支持委托/超时升级
+const DELEGATABLE_TYPES = ['stage_advance', 'interview_conclusion', 'offer_issue']
+const DELEG_ROLE_OF = { stage_advance: 'hiring_manager', interview_conclusion: 'recruiter', offer_issue: 'hiring_manager' }
 const STATUS_META = {
   pending: ['⏳', '审批中', 'var(--accent2)'],
   returned: ['↩️', '已退回', 'var(--red)'],
@@ -42,23 +52,41 @@ const fmtWindow = iso => iso ? String(iso).replace('T', ' ').slice(0, 16) : '立
 const positionName = id => store.positions.find(p => p.id === Number(id))?.name || `职位 #${id}`
 const STEP_ACTION = {
   submit: ['📨', '提交申请'], approve: ['✅', '审批通过'], return: ['↩️', '退回'],
-  resubmit: ['🔁', '修改重提'], cancel: ['🚫', '撤销'], execute: ['⚡', '执行回写'], failed: ['⚠️', '执行失败']
+  resubmit: ['🔁', '修改重提'], cancel: ['🚫', '撤销'], execute: ['⚡', '执行回写'], failed: ['⚠️', '执行失败'],
+  escalate: ['⏰', '超时升级'], delegate: ['🤝', '审批委托'], delegate_revoke: ['🔒', '撤销委托']
 }
-const ROLE_LABEL = { recruiter: '招聘负责人', interviewer: '面试官', hiring_manager: '用人经理' }
+const ROLE_LABEL = { recruiter: '招聘负责人', interviewer: '面试官', hiring_manager: '用人经理', hr_director: '招聘总监' }
 
 const myId = computed(() => store.userId)
 const myRole = computed(() => store.myRole)
 
-// 待我审批：进行中且当前节点角色 = 我的角色
-const todoList = computed(() => store.approvals.filter(t =>
-  t.status === 'pending' && t.chain[t.current_step]?.role === myRole.value))
+// 任务 → 我的审批权（direct/delegate）
+const authorityOf = t => store.myStepAuthority(t)
+
+// 待我审批：进行中且我对当前节点有直接/代理审批权
+const todoList = computed(() => store.approvals
+  .map(t => ({ t, auth: t.status === 'pending' ? authorityOf(t) : null }))
+  .filter(x => x.auth))
+const proxyTodoCount = computed(() => todoList.value.filter(x => x.auth.via === 'delegate').length)
 // 我发起的
 const mineList = computed(() => store.approvals.filter(t => t.submitted_by === myId.value))
 const returnedMine = computed(() => mineList.value.filter(t => t.status === 'returned'))
 const list = computed(() =>
-  tab.value === 'todo' ? todoList.value : tab.value === 'mine' ? mineList.value : store.approvals)
+  tab.value === 'todo'
+    ? todoList.value.map(x => x.t)
+    : tab.value === 'mine' ? mineList.value : store.approvals)
 
 const closedCount = computed(() => store.approvals.filter(t => ['approved', 'failed', 'cancelled'].includes(t.status)).length)
+
+// 超时/截止展示
+function dueInfo(t) {
+  if (t.status !== 'pending' || !t.due_at) return null
+  const ms = new Date(t.due_at.replace(/-/g, '/')).getTime() - Date.now()
+  if (Number.isNaN(ms)) return { text: `截止 ${fmtWindow(t.due_at)}`, overdue: false }
+  const h = ms / 3600000
+  if (ms <= 0) return { text: `已超时 ${Math.abs(h) < 1 ? Math.round(Math.abs(ms) / 60000) + ' 分钟' : Math.abs(h).toFixed(1) + ' 小时'}`, overdue: true }
+  return { text: `剩余 ${h < 1 ? Math.round(ms / 60000) + ' 分钟' : h.toFixed(1) + ' 小时'}`, overdue: false }
+}
 
 function payloadSummary(t) {
   const p = t.payload || {}
@@ -73,11 +101,19 @@ function payloadSummary(t) {
   }
   return ''
 }
-// 审批链节点展示：提交 → 各级审批；当前等待节点高亮
+// 审批链节点展示：提交 → 各级审批（含超时升级追加节点）；当前等待节点高亮
 function chainNodes(t) {
   return [
     { label: '提交', role: t.submitted_role, who: t.submitted_by_name },
-    ...t.chain.map(c => ({ label: ROLE_LABEL[c.role] || c.role, role: c.role, reason: c.reason || '' }))
+    ...t.chain.map((c, i) => ({
+      label: ROLE_LABEL[c.role] || c.role,
+      role: c.role,
+      reason: c.reason || '',
+      escalated: !!c.escalated_node_at,
+      due_at: c.due_at || '',
+      slaHours: c.sla?.timeout_hours || 0,
+      index: i
+    }))
   ]
 }
 function nodeState(t, idx) {
@@ -90,11 +126,15 @@ function nodeState(t, idx) {
   if (idx <= t.current_step) return 'done'
   return 'off'
 }
-const canDecide = t => t.status === 'pending' && t.chain[t.current_step]?.role === myRole.value
+const canDecide = t => t.status === 'pending' && !!authorityOf(t)
 const canOperate = t => t.submitted_by === myId.value && ['pending', 'returned'].includes(t.status)
 const busy = id => !!store.pending[`appr:${id}`]
 
-function onApprove(t) { store.decideApproval(t.id, { action: 'approve', version: t.version }, '已通过审批') }
+function onApprove(t) {
+  const auth = authorityOf(t)
+  store.decideApproval(t.id, { action: 'approve', version: t.version },
+    auth?.via === 'delegate' ? `已代${ROLE_LABEL[auth.role] || auth.role}通过审批` : '已通过审批')
+}
 function openReturn(t) { returnTarget.value = t; returnNote.value = '' }
 function confirmReturn() {
   const t = returnTarget.value
@@ -140,6 +180,74 @@ function confirmResubmit() {
 }
 function toggleSteps(t) { expandSteps.value = { ...expandSteps.value, [t.id]: !expandSteps.value[t.id] } }
 const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
+
+// ---------------- 委托 ----------------
+// 可委托的角色=本人角色；只对三类关键审批开放（策略发布不支持委托）
+const delegableTypes = computed(() => DELEGATABLE_TYPES.filter(tp => DELEG_ROLE_OF[tp] === myRole.value))
+const canDelegate = computed(() => delegableTypes.value.length > 0)
+// 可选择的代理人：除本人外的所有用户（允许跨角色委托）
+const delegateeOptions = computed(() => store.users.filter(u => u.id !== myId.value))
+function openDelegate() {
+  const tp = delegableTypes.value
+  dlg.value = {
+    role: myRole.value, delegatee_id: delegateeOptions.value[0]?.id || '',
+    task_types: [...tp], scope: 'all', application_ids: [], note: '', expires_at: ''
+  }
+  showDelegate.value = true
+}
+// 可限定范围的在途应聘
+const inProgressApps = computed(() => store.applications
+  .filter(a => !['hired', 'rejected'].includes(a.stage))
+  .map(a => ({ id: a.id, label: `${a.candidate} · ${a.position}（${STAGE_LABEL[a.stage] || a.stage}）` })))
+function submitDelegate() {
+  const d = dlg.value
+  if (!d.delegatee_id) { store.notify('error', '请选择代理人'); return }
+  if (!d.task_types.length) { store.notify('error', '请至少选择一种审批类型'); return }
+  if (!d.note.trim()) { store.notify('error', '委托事由必填'); return }
+  if (d.scope === 'applications' && !d.application_ids.length) { store.notify('error', '请选择适用的应聘记录'); return }
+  store.grantDelegation({
+    role: d.role, delegatee_id: d.delegatee_id, task_types: d.task_types,
+    scope: d.scope, application_ids: d.application_ids.map(Number),
+    note: d.note.trim(), expires_at: d.expires_at ? new Date(d.expires_at).toISOString() : ''
+  }).then(r => { if (r?.ok) showDelegate.value = false })
+}
+function onRevokeDelegation(d) {
+  const note = window.prompt(`撤销给「${d.delegatee_name}」的委托（将立即收回代理权限），可填写原因：`, '')
+  if (note === null) return
+  store.revokeDelegation(d.id, note.trim())
+}
+const fmtExpire = iso => iso ? fmtWindow(iso) : '长期有效'
+const typeLabel = tp => TYPE_META[tp]?.label || tp
+
+// ---------------- 超时升级规则 ----------------
+// 三类审批的全部可能节点角色（offer 含加签终审节点）
+const RULE_KEYS = [
+  { task_type: 'stage_advance', role: 'hiring_manager' },
+  { task_type: 'interview_conclusion', role: 'recruiter' },
+  { task_type: 'offer_issue', role: 'hiring_manager' },
+  { task_type: 'offer_issue', role: 'recruiter' }
+]
+const ruleOf = (tp, role) => store.escalationRules.find(r => r.task_type === tp && r.role === role) || null
+function openRules() {
+  rulesDraft.value = RULE_KEYS.map(k => {
+    const r = ruleOf(k.task_type, k.role)
+    return {
+      ...k,
+      timeout_hours: r?.timeout_hours ?? 24,
+      escalate_to: r?.escalate_to || 'hr_director',
+      enabled: r ? r.enabled : true
+    }
+  })
+  showRules.value = true
+}
+function saveRules() {
+  const bad = rulesDraft.value.find(r => r.enabled && (!(Number(r.timeout_hours) > 0) || !r.escalate_to || r.escalate_to === r.role))
+  if (bad) { store.notify('error', '时限需大于 0，且升级目标不能与节点角色相同'); return }
+  store.saveEscalationRules(rulesDraft.value.map(r => ({
+    task_type: r.task_type, role: r.role, timeout_hours: Number(r.timeout_hours),
+    escalate_to: r.escalate_to, enabled: r.enabled ? 1 : 0
+  }))).then(r => { if (r?.ok) showRules.value = false })
+}
 </script>
 
 <template>
@@ -148,7 +256,27 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
     <div class="role-banner card">
       <span v-if="myRole === 'recruiter'">🧭 当前身份「招聘负责人」：可提请<b>候选人推进</b>、发起<b>Offer 发放</b>与<b>匹配策略灰度/全量发布</b>申请，并审批面试官提交的<b>面试结论</b>；超带宽 Offer 由您终审。</span>
       <span v-else-if="myRole === 'interviewer'">💬 当前身份「面试官」：可提交<b>面试结论</b>申请（通过/不通过），由招聘负责人审批后生效。</span>
-      <span v-else>🏢 当前身份「用人经理」：审批<b>候选人推进</b>、<b>Offer 发放</b>与<b>匹配策略发布</b>申请；可退回并附意见，申请人修改后可重新提交。</span>
+      <span v-else-if="myRole === 'hiring_manager'">🏢 当前身份「用人经理」：审批<b>候选人推进</b>、<b>Offer 发放</b>与<b>匹配策略发布</b>申请；可退回并附意见，申请人修改后可重新提交。</span>
+      <span v-else>⏫ 当前身份「招聘总监」：处理超时升级的审批任务，并可被委托为代理人。</span>
+    </div>
+
+    <!-- 委托 / 超时升级管理条 -->
+    <div class="delegate-bar card">
+      <div class="db-left">
+        <button v-if="canDelegate" class="primary sm" @click="openDelegate">🤝 委托我的审批权</button>
+        <button class="ghost sm" @click="store.sweepApprovals()">⏰ 同步超时升级</button>
+        <button v-if="myRole === 'recruiter'" class="ghost sm" @click="openRules">⏳ 超时规则</button>
+        <em class="muted db-hint" v-if="proxyTodoCount">您有 <b>{{ proxyTodoCount }}</b> 个代理审批待办</em>
+      </div>
+      <div class="db-right">
+        <span class="dlg-chip" v-for="d in store.myDelegationsOut" :key="d.id">
+          已委托 {{ d.delegatee_name }}（{{ d.task_types.map(typeLabel).join('、') }} · {{ fmtExpire(d.expires_at) }}）
+          <button class="linkbtn" @click="onRevokeDelegation(d)">撤销</button>
+        </span>
+        <span class="dlg-chip proxy" v-for="d in store.myDelegated" :key="'in-' + d.id">
+          🤝 代理 {{ d.delegator_name }} 的{{ ROLE_LABEL[d.role] || d.role }}审批（{{ d.task_types.map(typeLabel).join('、') }}）
+        </span>
+      </div>
     </div>
 
     <div class="stat-row">
@@ -179,18 +307,26 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
           <span class="t-status" :style="{ color: STATUS_META[t.status][2], borderColor: STATUS_META[t.status][2] }">
             {{ STATUS_META[t.status][0] }} {{ STATUS_META[t.status][1] }}
           </span>
+          <span class="proxy-badge" v-if="t.status === 'pending' && authorityOf(t)?.via === 'delegate'">
+            🤝 代理{{ ROLE_LABEL[authorityOf(t).role] }}·{{ authorityOf(t).delegation.delegator_name }}
+          </span>
+          <span class="esc-badge" v-if="t.escalated">⏰ 已超时升级</span>
           <em class="muted">#{{ t.id }}</em>
         </div>
         <div class="t-main">
           <b>{{ t.candidate || (t.type === 'strategy_publish' ? positionName(t.payload.position_id) : '') }}</b>
           <span class="muted">{{ t.position || (t.type === 'strategy_publish' ? '匹配策略治理' : t.dept) }}</span>
           <span class="t-summary">{{ payloadSummary(t) }}</span>
+          <span class="due-tag" :class="{ overdue: dueInfo(t)?.overdue }" v-if="dueInfo(t)">
+            ⏳ {{ dueInfo(t).text }}<template v-if="t.current_role"> · 待{{ ROLE_LABEL[t.current_role] || t.current_role }}</template>
+          </span>
         </div>
-        <!-- 审批链进度：提交 → 逐级审批，当前等待节点高亮 -->
+        <!-- 审批链进度：提交 → 逐级审批（超时升级在链尾追加节点，原节点保留可见） -->
         <div class="chain">
           <template v-for="(n, i) in chainNodes(t)" :key="i">
-            <div class="cnode" :class="nodeState(t, i)" :title="n.reason || n.who || ''">
-              <i>{{ nodeState(t, i) === 'done' ? '✓' : i === 0 ? '📨' : '⏳' }}</i>
+            <div class="cnode" :class="[nodeState(t, i), { escalated: n.escalated }]"
+                 :title="n.reason || n.who || (n.escalated ? '该节点超时后升级' : '')">
+              <i>{{ nodeState(t, i) === 'done' ? '✓' : i === 0 ? '📨' : (n.escalated ? '⏰' : '⏳') }}</i>
               <span>{{ n.label }}</span>
             </div>
             <em v-if="i < chainNodes(t).length - 1" class="carrow">→</em>
@@ -218,12 +354,12 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
           </button>
         </div>
 
-        <!-- 审批步骤留痕：提交/通过/退回/重提/执行回写全程可审计 -->
+        <!-- 审批步骤留痕：提交/通过/退回/重提/委托/升级/执行回写全程可审计 -->
         <div class="steps" v-if="expandSteps[t.id]">
           <div class="step" v-for="s in t.steps" :key="s.id">
             <span class="s-icon">{{ STEP_ACTION[s.action]?.[0] || '•' }}</span>
             <div class="s-body">
-              <b>{{ STEP_ACTION[s.action]?.[1] || s.action }}</b>
+              <b>{{ STEP_ACTION[s.action]?.[1] || s.action }} <em class="via-tag" v-if="s.via === 'delegate'">代理</em><em class="via-tag esc" v-else-if="s.action === 'escalate'">系统</em></b>
               <span class="muted">{{ s.actor_name }}<template v-if="s.role">（{{ ROLE_LABEL[s.role] || s.role }}）</template> · {{ fmtTime(s.acted_at) }}</span>
               <p v-if="s.note">{{ s.note }}</p>
             </div>
@@ -296,6 +432,74 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
         </div>
       </div>
     </div>
+
+    <!-- 审批委托：把本人某角色的审批权授予代理人（类型/应聘范围/到期时间），撤销立即收权 -->
+    <div class="modal" v-if="showDelegate" @click.self="showDelegate = false">
+      <div class="modal-box card dlp">
+        <h3>🤝 委托我的审批权</h3>
+        <p class="muted">代理人将以「代理{{ ROLE_LABEL[dlg.role] || dlg.role }}」身份处理您节点上的审批，全程留痕；撤销或到期后其在途待办立即失效。</p>
+        <label class="muted">代理人（可跨角色选择）</label>
+        <select v-model="dlg.delegatee_id">
+          <option v-for="u in delegateeOptions" :key="u.id" :value="u.id">{{ u.name }} · {{ u.title }}</option>
+        </select>
+        <label class="muted">委托的审批类型</label>
+        <div class="acts">
+          <label class="chk" v-for="tp in delegableTypes" :key="tp">
+            <input type="checkbox" :value="tp" v-model="dlg.task_types" /> {{ typeLabel(tp) }}
+          </label>
+        </div>
+        <label class="muted">适用范围</label>
+        <div class="acts">
+          <label class="chk"><input type="radio" value="all" v-model="dlg.scope" /> 该类型全部在途与后续任务</label>
+          <label class="chk"><input type="radio" value="applications" v-model="dlg.scope" /> 仅指定应聘</label>
+        </div>
+        <select v-if="dlg.scope === 'applications'" multiple class="app-select" v-model="dlg.application_ids">
+          <option v-for="a in inProgressApps" :key="a.id" :value="a.id">{{ a.label }}</option>
+        </select>
+        <div class="two-col">
+          <label class="muted">到期时间（留空=长期，直到撤销）
+            <input type="datetime-local" v-model="dlg.expires_at" />
+          </label>
+        </div>
+        <label class="muted">委托事由（必填）</label>
+        <textarea v-model="dlg.note" rows="2" placeholder="如：休假期间由 XX 代审候选人推进；紧急事务请电话同步"></textarea>
+        <div class="acts" style="margin-top:12px">
+          <button class="primary" :disabled="!!store.pending['delegate-new:' + dlg.role + ':' + dlg.delegatee_id]" @click="submitDelegate">确认委托</button>
+          <button class="ghost" @click="showDelegate = false">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 超时升级规则：按 审批类型×节点角色 配置 SLA；规则快照进新任务审批链，不影响已在途节点 -->
+    <div class="modal" v-if="showRules" @click.self="showRules = false">
+      <div class="modal-box card rules-box">
+        <h3>⏳ 审批超时升级规则</h3>
+        <p class="muted">节点超过 SLA 未处理时，系统在<b>审批链尾追加升级节点</b>（原节点与快照保留）并通知升级角色；改规则仅影响之后产生的新节点。防环：不能升级给链上已存在的角色。</p>
+        <table class="rules-table">
+          <thead><tr><th>审批类型</th><th>超时节点</th><th>时限(小时)</th><th>升级到</th><th>启用</th></tr></thead>
+          <tbody>
+            <tr v-for="(r, i) in rulesDraft" :key="r.task_type + r.role">
+              <td>{{ typeLabel(r.task_type) }}</td>
+              <td>{{ ROLE_LABEL[r.role] }}</td>
+              <td><input type="number" min="0.5" step="0.5" v-model.number="r.timeout_hours" :disabled="!r.enabled" /></td>
+              <td>
+                <select v-model="r.escalate_to" :disabled="!r.enabled">
+                  <option value="hr_director">招聘总监</option>
+                  <option value="hiring_manager">用人经理</option>
+                  <option value="recruiter">招聘负责人</option>
+                </select>
+              </td>
+              <td><input type="checkbox" v-model="r.enabled" /></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="acts" style="margin-top:12px">
+          <button class="primary" :disabled="!!store.pending['escalation-rules-save']" @click="saveRules">保存规则</button>
+          <button class="ghost" @click="showRules = false">取消</button>
+          <button class="ghost" @click="store.sweepApprovals()">⏰ 立即扫描一次</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -354,4 +558,36 @@ textarea { width: 100%; background: #101731; border: 1px solid var(--border); bo
 .modal-box .acts button.on.succ { background: var(--green); color: #06231a; }
 .modal-box .acts button.on.danger { background: var(--red); color: #fff; }
 .empty { padding: 30px; text-align: center; color: var(--muted); }
+
+/* 委托 / 超时升级管理条 */
+.delegate-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 14px; flex-wrap: wrap; }
+.db-left { display: flex; align-items: center; gap: 8px; }
+.db-left .sm { font-size: 12px; padding: 5px 11px; }
+.db-hint { font-style: normal; font-size: 12px; }
+.db-hint b { color: var(--accent2); }
+.db-right { display: flex; gap: 6px; flex-wrap: wrap; }
+.dlg-chip { font-size: 11px; font-style: normal; border: 1px solid var(--border); background: var(--panel2); border-radius: 12px; padding: 3px 10px; color: var(--muted); display: inline-flex; gap: 6px; align-items: center; }
+.dlg-chip.proxy { border-color: rgba(255,209,102,.5); color: var(--accent2); background: rgba(255,209,102,.08); }
+.linkbtn { border: none; background: none; color: var(--red); cursor: pointer; font-size: 11px; padding: 0; }
+.proxy-badge { font-size: 10.5px; border: 1px solid rgba(255,209,102,.55); color: var(--accent2); background: rgba(255,209,102,.1); border-radius: 10px; padding: 2px 8px; }
+.esc-badge { font-size: 10.5px; border: 1px solid rgba(255,107,122,.5); color: var(--red); background: rgba(255,107,122,.08); border-radius: 10px; padding: 2px 8px; }
+.due-tag { margin-left: auto; font-size: 11px; color: var(--muted); font-style: normal; }
+.due-tag.overdue { color: var(--red); font-weight: 700; }
+.cnode.escalated { color: var(--red); border-color: rgba(255,107,122,.45); background: rgba(255,107,122,.07); }
+.via-tag { font-style: normal; font-size: 10px; border-radius: 8px; padding: 0 6px; margin-left: 4px; color: var(--accent2); border: 1px solid rgba(255,209,102,.4); }
+.via-tag.esc { color: var(--red); border-color: rgba(255,107,122,.4); }
+
+/* 委托 / 规则弹窗 */
+.modal-box.dlp, .modal-box.rules-box { max-width: 560px; width: 560px; }
+.modal-box select { width: 100%; margin: 4px 0 8px; }
+.chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--text); }
+.chk input { width: auto; margin: 0; }
+.app-select { min-height: 110px; }
+.two-col { display: grid; grid-template-columns: 1fr; gap: 8px; }
+.rules-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 8px; }
+.rules-table th, .rules-table td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; }
+.rules-table th { background: var(--panel2); color: var(--muted); font-weight: 600; }
+.rules-table input[type=number] { width: 76px; padding: 5px; }
+.rules-table input[type=checkbox] { width: auto; }
+.rules-table select { width: auto; margin: 0; }
 </style>

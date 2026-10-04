@@ -42,6 +42,23 @@ export const useHrStore = defineStore('hr', {
     users: s => s.data?.users || [],
     approvals: s => s.data?.approvals || [],
     notifications: s => s.data?.notifications || [],
+    // 按角色审批委托 / 超时升级规则
+    delegations: s => s.data?.delegations || [],
+    escalationRules: s => s.data?.escalationRules || [],
+    activeDelegations(s) {
+      return this.delegations.filter(d => d.status === 'active' && (!d.expires_at || new Date(d.expires_at) > new Date()))
+    },
+    // 我作为代理人持有的有效委托
+    myDelegated(s) {
+      return this.activeDelegations.filter(d => d.delegatee_id === s.userId)
+    },
+    // 我委托给别人的有效委托
+    myDelegationsOut(s) {
+      return this.activeDelegations.filter(d => d.delegator_id === s.userId)
+    },
+    userById() {
+      return id => (this.data?.users || []).find(u => u.id === id) || null
+    },
     // 跨角色危机处置审计
     crisisIncidents: s => s.data?.crisisIncidents || [],
     crisisEntries: s => s.data?.crisisEntries || [],
@@ -62,18 +79,37 @@ export const useHrStore = defineStore('hr', {
     // 当前身份与角色能力：关键动作（提请推进/给结论/发起 Offer/审批）按角色在 UI 层前置拦截
     currentUser(s) { return (s.data?.users || []).find(u => u.id === s.userId) || null },
     myRole() { return this.currentUser?.role || 'recruiter' },
+    // 通知：角色桶（recipient_id 为空）+ 定向给本人的代理/升级个人通知
     myNotifications() {
-      return this.notifications.filter(n => n.recipient_role === this.myRole)
+      return this.notifications.filter(n =>
+        n.recipient_role === this.myRole || n.recipient_id === this.userId)
     },
     unreadCount() { return this.myNotifications.filter(n => !n.is_read).length },
+    // 我对某任务当前节点是否有审批权：直接（角色匹配）或持有有效委托（类型/应聘范围匹配）
+    myStepAuthority: s => (task, stepOverride = null) => {
+      const me = s.currentUser
+      if (!me) return null
+      const step = stepOverride || task?.chain?.[task.current_step]
+      if (!step) return null
+      if (me.role === step.role) return { via: 'direct', role: step.role }
+      const nowMs = Date.now()
+      for (const d of s.activeDelegations) {
+        if (d.delegatee_id !== me.id || d.role !== step.role) continue
+        if (d.task_types?.length && !d.task_types.includes(task.type)) continue
+        if (d.scope === 'applications' && task.application_id &&
+            !(d.application_ids || []).includes(Number(task.application_id))) continue
+        if (d.expires_at && new Date(d.expires_at).getTime() <= nowMs) continue
+        return { via: 'delegate', role: step.role, delegation: d }
+      }
+      return null
+    },
     // 某应聘是否存在进行中的审批（可选指定类型）：看板/面试/Offer 页用来显示「审批中」并禁止重复提请
     pendingTask: s => (appId, type) =>
       (s.data?.approvals || []).find(t => t.application_id === appId && t.status === 'pending' && (!type || t.type === type)) || null,
-    // 待当前角色审批的任务数（审批中心红点）
+    // 待当前身份审批的任务数（直接审批 + 代理审批），审批中心红点口径
     todoCount() {
       return this.approvals.filter(t =>
-        t.status === 'pending' && t.chain[t.current_step]?.role === this.myRole
-      ).length
+        t.status === 'pending' && !!this.myStepAuthority(t)).length
     },
     // 预约协商待办：面试官=待本人确认/改期确认的预约；招聘负责人=待候选人确认 + 系统初判缺席待裁定
     scheduleTodoCount() {
@@ -238,6 +274,33 @@ export const useHrStore = defineStore('hr', {
     cancelApproval(id) {
       return this.runBusy(`appr:${id}`, () =>
         this.api('POST', `/approvals/${id}/cancel`, {}, { success: '申请已撤销' }))
+    },
+    // ---------------- 按角色委托与超时升级 ----------------
+    grantDelegation(payload) {
+      return this.runBusy(`delegate-new:${payload.role}:${payload.delegatee_id}`, () =>
+        this.api('POST', '/delegations', payload, { success: '委托已生效，代理人可处理在途任务' }))
+    },
+    revokeDelegation(id, note) {
+      return this.runBusy(`delegate-revoke:${id}`, () =>
+        this.api('POST', `/delegations/${id}/revoke`, { note }, { success: '委托已撤销，代理权限立即收回' }))
+    },
+    saveEscalationRules(rules) {
+      return this.runBusy('escalation-rules-save', () =>
+        this.api('POST', '/escalation-rules', { rules }, { success: '超时升级规则已保存（仅影响新任务）' }))
+    },
+    sweepApprovals() {
+      return this.runBusy('approval-sweep', async () => {
+        try {
+          const r = await j('GET', '/approvals/sweep')
+          await this.refresh()
+          if (r.count || r.delegations_expired) {
+            this.notify('success', `扫描完成：${r.count} 个任务超时升级，${r.delegations_expired} 个委托到期`)
+          } else {
+            this.notify('success', '暂无超时任务，审批时限已是最新')
+          }
+          return r
+        } catch (e) { this.notify('error', e.message); return null }
+      })
     },
     markNotificationsRead(ids) {
       return this.api('POST', '/notifications/read', ids?.length ? { ids } : {})

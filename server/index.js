@@ -72,7 +72,9 @@ function rollbackForIncident(applicationId, operatorName, reason) {
 }
 
 // ---------------- 角色与审批链 ----------------
-const ROLE_LABEL = { recruiter: '招聘负责人', interviewer: '面试官', hiring_manager: '用人经理' }
+const ROLE_LABEL = {
+  recruiter: '招聘负责人', interviewer: '面试官', hiring_manager: '用人经理', hr_director: '招聘总监'
+}
 // 三类需审批的关键动作及其允许的发起角色；审批链在提交时按类型（+动态规则）固化
 const TASK_TYPES = {
   stage_advance: { label: '候选人推进', submitRole: 'recruiter' },
@@ -80,6 +82,8 @@ const TASK_TYPES = {
   offer_issue: { label: 'Offer 发放', submitRole: 'recruiter' },
   strategy_publish: { label: '匹配策略发布', submitRole: 'recruiter' }
 }
+// 仅这三类关键动作支持按角色委托与超时升级（策略发布不在本次范围内）
+const DELEGATABLE_TYPES = ['stage_advance', 'interview_conclusion', 'offer_issue']
 
 // 身份解析：前端每次请求带 x-user-id；缺省回退招聘负责人，保证旧调用兼容
 function currentUser(req) {
@@ -88,33 +92,164 @@ function currentUser(req) {
   return u || db.prepare("SELECT * FROM users WHERE role='recruiter' ORDER BY id LIMIT 1").get()
 }
 
+// ---------------- 超时升级规则（SLA） ----------------
+function getEscalationRule(type, role) {
+  return db.prepare('SELECT * FROM approval_escalation_rules WHERE task_type=? AND role=?')
+    .get(type, role) || null
+}
+// 规则在节点生成瞬间快照进审批链：之后改规则只影响新任务/新升级节点，在途节点口径冻结
+function ruleSlaSnapshot(type, role) {
+  const r = getEscalationRule(type, role)
+  if (!r || !r.enabled) return null
+  return {
+    timeout_hours: Number(r.timeout_hours),
+    escalate_to: r.escalate_to,
+    rule_updated_at: r.updated_at || ''
+  }
+}
+// 节点进入待审时刻：固化 deadline（本地时间字符串，与 acted_at/submitted_at 同口径可比）
+function stampNodeDue(node, at = ts()) {
+  const hours = Number(node?.sla?.timeout_hours)
+  if (!hours || !(hours > 0)) { node.due_at = ''; return node }
+  const d = new Date(Date.now() + hours * 3600 * 1000)
+  node.entered_at = at
+  node.due_at = d.toLocaleString('zh-CN')
+  return node
+}
+
 // 审批链规则：推进/结论为单级；Offer 发放由用人经理审批，薪资超职位带宽时自动加签招聘负责人终审
+// 每个节点同时快照该「类型×节点角色」的超时升级 SLA（无规则=不超时升级）
 function buildChain(type, payload, app = null) {
-  if (type === 'stage_advance') return [{ role: 'hiring_manager' }]
-  if (type === 'interview_conclusion') return [{ role: 'recruiter' }]
-  if (type === 'strategy_publish') return [{ role: 'hiring_manager', reason: '匹配策略影响评分、投递与阶段快照口径' }]
-  if (type === 'offer_issue') {
-    const chain = [{ role: 'hiring_manager' }]
+  let roles = []
+  if (type === 'stage_advance') roles = [{ role: 'hiring_manager' }]
+  else if (type === 'interview_conclusion') roles = [{ role: 'recruiter' }]
+  else if (type === 'strategy_publish') roles = [{ role: 'hiring_manager', reason: '匹配策略影响评分、投递与阶段快照口径' }]
+  else if (type === 'offer_issue') {
+    roles = [{ role: 'hiring_manager' }]
     const pos = app && db.prepare('SELECT salary_max FROM positions WHERE id=?').get(app.position_id)
     if (pos && num(payload.salary) > num(pos.salary_max)) {
-      chain.push({ role: 'recruiter', reason: `月薪超职位带宽上限 ¥${num(pos.salary_max).toLocaleString()}，加签终审` })
+      roles.push({ role: 'recruiter', reason: `月薪超职位带宽上限 ¥${num(pos.salary_max).toLocaleString()}，加签终审` })
     }
-    return chain
   }
-  return []
+  return roles.map(node => {
+    const sla = DELEGATABLE_TYPES.includes(type) ? ruleSlaSnapshot(type, node.role) : null
+    return sla ? { ...node, sla } : node
+  })
 }
 
-function addStep(taskId, { stepNo = -1, role = '', action, actor, note = '' }) {
-  db.prepare(`INSERT INTO approval_steps(task_id,step_no,role,action,actor_id,actor_name,note,acted_at)
-              VALUES(?,?,?,?,?,?,?,?)`)
-    .run(taskId, stepNo, role, action, actor?.id || '', actor?.name || actor || '', note, ts())
+// ---------------- 按角色审批委托 ----------------
+function parseDelegationRow(d) {
+  return {
+    ...d,
+    task_types: parseJSON(d.task_types, []),
+    application_ids: parseJSON(d.application_ids, []).map(x => num(x)),
+    enabled: !!d.enabled
+  }
+}
+// 该委托当前是否有效：状态 active + 未到期
+function delegationActiveAt(d, atMs = Date.now()) {
+  if (!d || d.status !== 'active') return null
+  if (d.expires_at) {
+    const exp = new Date(d.expires_at).getTime()
+    if (Number.isFinite(exp) && exp <= atMs) return null
+  }
+  return d
+}
+// 解析某人对某任务当前节点是否持有审批权：
+// 1) 本人角色即节点角色（直接审批权）；2) 存在有效委托把该角色委托给本人（按类型/应聘范围匹配）。
+// 委托在决策瞬间实时解析——撤销/到期立即失效，即便页面过期也会被服务端拒绝。
+function resolveStepAuthority(task, step, user, atMs = Date.now()) {
+  if (!step) return null
+  if (user.role === step.role) return { via: 'direct', role: step.role, delegation: null }
+  const rows = db.prepare("SELECT * FROM approval_delegations WHERE delegatee_id=? AND role=? AND status='active' ORDER BY id DESC")
+    .all(user.id, step.role)
+  for (const raw of rows) {
+    const d = parseDelegationRow(raw)
+    if (!delegationActiveAt(d, atMs)) continue
+    if (d.task_types.length && !d.task_types.includes(task.type)) continue
+    if (d.scope === 'applications' && num(task.application_id) && !d.application_ids.includes(num(task.application_id))) continue
+    return { via: 'delegate', role: step.role, delegation: d }
+  }
+  return null
+}
+// 该节点角色当前的全部有效代理人（用于同事务投递个人待办/撤销通知）
+function activeDelegatesFor(role, { taskType = '', applicationId = 0 } = {}) {
+  // 策略发布等类型不参与按角色委托
+  if (taskType && !DELEGATABLE_TYPES.includes(taskType)) return []
+  return db.prepare("SELECT * FROM approval_delegations WHERE role=? AND status='active' ORDER BY id")
+    .all(role)
+    .map(parseDelegationRow)
+    .filter(d => {
+      if (!delegationActiveAt(d)) return false
+      if (taskType && d.task_types.length && !d.task_types.includes(taskType)) return false
+      if (applicationId && d.scope === 'applications' && num(applicationId) && !d.application_ids.includes(num(applicationId))) return false
+      return true
+    })
 }
 
-// 审计通知：按接收角色投递，审批中心与顶栏铃铛共用同一数据源
-function notify({ recipientRole, type, title, body, taskId = 0, appId = 0 }) {
-  db.prepare(`INSERT INTO notifications(recipient_role,type,title,body,task_id,application_id,is_read,created_at)
-              VALUES(?,?,?,?,?,?,0,?)`)
-    .run(recipientRole, type, title, body, taskId, appId, ts())
+function addStep(taskId, { stepNo = -1, role = '', action, actor, note = '', via = '', delegationId = 0 }) {
+  db.prepare(`INSERT INTO approval_steps(task_id,step_no,role,action,actor_id,actor_name,note,acted_at,via,delegation_id)
+              VALUES(?,?,?,?,?,?,?,?,?,?)`)
+    .run(taskId, stepNo, role, action, actor?.id || '', actor?.name || actor || '', note, ts(),
+      via || '', num(delegationId) || 0)
+}
+
+// 审计通知：默认按接收角色投递；recipientId 非空时为个人通知（代理人/升级对象），仅其本人可见
+function notify({ recipientRole, type, title, body, taskId = 0, appId = 0, recipientId = '', delegationId = 0 }) {
+  db.prepare(`INSERT INTO notifications(recipient_role,recipient_id,delegation_id,type,title,body,task_id,application_id,is_read,created_at)
+              VALUES(?,?,?,?,?,?,?,?,0,?)`)
+    .run(recipientRole, recipientId, num(delegationId), type, title, body, taskId, appId, ts())
+}
+
+// 节点待办通知：角色桶 + 每个有效代理人的个人待办（代理人若本身就是该角色，不重复投递）
+function notifyStepAudience(task, step, { type, title, body, extraDelegations = [] }) {
+  notify({ recipientRole: step.role, type, title, body, taskId: task.id, appId: task.application_id })
+  const ds = (extraDelegations.length ? extraDelegations : activeDelegatesFor(step.role, { taskType: task.type, applicationId: task.application_id }))
+  ds.forEach(d => {
+    const delegatee = db.prepare('SELECT role FROM users WHERE id=?').get(d.delegatee_id)
+    if (delegatee?.role === step.role) return
+    notify({
+      recipientRole: step.role, recipientId: d.delegatee_id, delegationId: d.id, type,
+      title: `【代理审批】${title}`, body: `${d.delegator_name} 已将该${ROLE_LABEL[step.role]}节点委托给您：${body}`,
+      taskId: task.id, appId: task.application_id
+    })
+  })
+}
+
+// 待办归并：节点流转/撤销/退回/升级时，把该任务上一节点受众（角色桶+代理人个人）的未读待办通知标记已读，
+// 保证铃铛/红点在并发、撤销、代理撤销后只反映当前真正待办。submitter 结果通知（task_returned 等）不受影响。
+const ACTIONABLE_NOTIFY_TYPES = ['task_submitted', 'task_resubmitted', 'task_escalated']
+function markActionableRead(taskId, audienceStep = null) {
+  const id = num(taskId)
+  if (!id) return 0
+  const types = ACTIONABLE_NOTIFY_TYPES.map(() => '?').join(',')
+  let rows
+  if (audienceStep) {
+    rows = db.prepare(`SELECT id FROM notifications
+                       WHERE task_id=? AND is_read=0 AND type IN (${types})
+                         AND (recipient_id='' OR recipient_id IS NULL OR recipient_id=? OR recipient_role=?)`)
+      .all(id, ...ACTIONABLE_NOTIFY_TYPES, audienceStep.role, audienceStep.role)
+  } else {
+    rows = db.prepare(`SELECT id FROM notifications WHERE task_id=? AND is_read=0 AND type IN (${types})`)
+      .all(id, ...ACTIONABLE_NOTIFY_TYPES)
+  }
+  if (rows.length) {
+    const marks = rows.map(() => '?').join(',')
+    db.prepare(`UPDATE notifications SET is_read=1 WHERE id IN (${marks})`).run(...rows.map(r => r.id))
+  }
+  return rows.length
+}
+// 按委托撤销归并：该代理人在指定（或全部）在途任务上的个人未读待办一次性已读
+function markDelegateTodosRead(delegationId, taskId = 0) {
+  const sql = `SELECT id FROM notifications WHERE recipient_id!='' AND delegation_id=? AND is_read=0 AND type IN (${ACTIONABLE_NOTIFY_TYPES.map(() => '?').join(',')})${taskId ? ' AND task_id=?' : ''}`
+  const args = [num(delegationId), ...ACTIONABLE_NOTIFY_TYPES]
+  if (taskId) args.push(num(taskId))
+  const rows = db.prepare(sql).all(...args)
+  if (rows.length) {
+    const marks = rows.map(() => '?').join(',')
+    db.prepare(`UPDATE notifications SET is_read=1 WHERE id IN (${marks})`).run(...rows.map(r => r.id))
+  }
+  return rows.length
 }
 
 // 乐观锁：阶段协同类操作必须携带读取时的 version；并发/重复点击导致版本错位时拒绝
@@ -563,11 +698,18 @@ app.get('/api/state', (req, res) => {
     const posId = a ? a.position_id : num(payload0.position_id)
     const pos = positions.find(p => p.id === posId)
     const cand = a ? candidates.find(c => c.id === a.candidate_id) : null
+    const chain = parseJSON(t.chain, [])
+    const steps = approvalSteps.filter(s => s.task_id === t.id)
+    const cur = chain[t.current_step] || null
     return {
       ...t,
-      payload: parseJSON(t.payload, {}),
-      chain: parseJSON(t.chain, []),
-      steps: approvalSteps.filter(s => s.task_id === t.id),
+      payload: payload0,
+      chain,
+      steps,
+      escalated: chain.some(n => !!n.escalated_at),
+      current_role: cur?.role || '',
+      due_at: cur?.due_at || '',
+      entered_at: cur?.entered_at || '',
       candidate: cand ? cand.name : '',
       position: pos ? pos.name : '',
       dept: pos ? pos.dept : '',
@@ -577,6 +719,14 @@ app.get('/api/state', (req, res) => {
   })
   const notifications = db.prepare('SELECT * FROM notifications ORDER BY id DESC LIMIT 300').all()
     .map(n => ({ ...n, is_read: !!n.is_read }))
+  // 审批委托与超时升级规则：审批中心按当前身份渲染代理待办、委托管理与 SLA 配置
+  const delegations = db.prepare('SELECT * FROM approval_delegations ORDER BY id DESC').all().map(d => ({
+    ...d,
+    task_types: parseJSON(d.task_types, []),
+    application_ids: parseJSON(d.application_ids, []).map(x => num(x))
+  }))
+  const escalationRules = db.prepare('SELECT * FROM approval_escalation_rules ORDER BY task_type, role').all()
+    .map(r => ({ ...r, enabled: !!r.enabled, timeout_hours: Number(r.timeout_hours) }))
   const latestItemOf = (cid, pid) => db.prepare(`SELECT ri.* FROM recalc_items ri
     WHERE ri.candidate_id=? AND ri.position_id=? ORDER BY ri.id DESC LIMIT 1`).get(cid, pid) || null
   const matchOf = (cid, pid) => matches.find(m => m.candidate_id === cid && m.position_id === pid) || null
@@ -615,6 +765,7 @@ app.get('/api/state', (req, res) => {
   res.json({
     positions, candidates, applications: pipelines, interviews, offers, offerLogs, channels, matches,
     strategyVersions, recalcJobs, recalcItems, users, approvals, notifications,
+    delegations, escalationRules,
     defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP },
     ...getCrisisState(),
     ...getScheduleState()
@@ -806,6 +957,7 @@ app.post('/api/positions/:id/strategy', (req, res, next) => {
         keyword_cap: payload.keywordCap
       }
       const chain = buildChain('strategy_publish', approvalPayload, null)
+      if (chain[0]) stampNodeDue(chain[0])
       const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(id)
       const tr = db.prepare(`INSERT INTO approval_tasks(type,application_id,interview_id,offer_id,payload,chain,current_step,status,submitted_by,submitted_by_name,submitted_role,submitted_at,version)
                              VALUES('strategy_publish',0,0,0,?,?,0,'pending',?,?,?,?,1)`)
@@ -1664,6 +1816,8 @@ app.post('/api/approvals', (req, res, next) => {
       }
 
       const chain = buildChain(type, payload, a)
+      // 首节点进入待审，固化其 SLA 截止时间快照
+      if (chain[0]) stampNodeDue(chain[0])
       const cand = db.prepare('SELECT name FROM candidates WHERE id=?').get(a.candidate_id)
       const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(a.position_id)
       const r = db.prepare(`INSERT INTO approval_tasks(type,application_id,interview_id,payload,chain,current_step,status,submitted_by,submitted_by_name,submitted_role,submitted_at,version)
@@ -1671,11 +1825,10 @@ app.post('/api/approvals', (req, res, next) => {
         .run(type, a.id, interviewId, JSON.stringify(payload), JSON.stringify(chain), user.id, user.name, user.role, ts())
       const taskId = Number(r.lastInsertRowid)
       addStep(taskId, { stepNo: -1, role: user.role, action: 'submit', actor: user, note: summary })
-      notify({
-        recipientRole: chain[0].role, type: 'task_submitted',
+      notifyStepAudience({ id: taskId, application_id: a.id, type }, chain[0], {
+        type: 'task_submitted',
         title: `新的${meta.label}审批待处理`,
-        body: `${user.name} 提交「${cand?.name || ''} · ${pos?.name || ''}」：${summary}`,
-        taskId, appId: a.id
+        body: `${user.name} 提交「${cand?.name || ''} · ${pos?.name || ''}」：${summary}`
       })
       return { ok: true, id: taskId, chain }
     })
@@ -1698,9 +1851,14 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
       const chain = parseJSON(t.chain, [])
       const step = chain[t.current_step]
       if (!step) conflict('审批链数据异常', 'chain_broken')
-      if (step.role !== user.role) {
-        forbidden(`当前节点需「${ROLE_LABEL[step.role]}」审批，您的角色为「${ROLE_LABEL[user.role]}」`, 'role_not_allowed')
+      // 权限实时解析：本人直接审批 或 持有该节点角色的有效委托；委托撤销/到期后即使页面过期也被拒绝
+      const authority = resolveStepAuthority(t, step, user)
+      if (!authority) {
+        forbidden(`当前节点需「${ROLE_LABEL[step.role]}」或其有效委托人审批，您当前身份「${ROLE_LABEL[user.role] || user.role}」无审批权`, 'role_not_allowed')
       }
+      const viaLabel = authority.via === 'delegate'
+        ? `（代理${ROLE_LABEL[step.role]} · 委托人 ${authority.delegation.delegator_name}）`
+        : ''
       const meta = TASK_TYPES[t.type]
       const note = String(b.note || '')
       const payloadNow = parseJSON(t.payload, {})
@@ -1717,32 +1875,45 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
           db.prepare("UPDATE strategy_versions SET status='returned' WHERE id=? AND status='pending'")
             .run(num(payloadNow.strategy_version_id))
         }
-        addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'return', actor: user, note })
+        markActionableRead(taskId, step)
+        addStep(taskId, {
+          stepNo: t.current_step, role: user.role, action: 'return', actor: user,
+          note: `${note}${viaLabel ? ' ' + viaLabel : ''}`,
+          via: authority.via, delegationId: authority.delegation?.id || 0
+        })
         notify({
           recipientRole: t.submitted_role, type: 'task_returned',
           title: `${meta.label}审批被退回`,
-          body: `${user.name} 退回「${who}」：${note}`,
+          body: `${user.name}${viaLabel} 退回「${who}」：${note}`,
           taskId, appId: t.application_id
         })
         return { ok: true, status: 'returned' }
       }
       if (b.action !== 'approve') badRequest('未知审批动作', 'unknown_action')
 
-      addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'approve', actor: user, note })
+      addStep(taskId, {
+        stepNo: t.current_step, role: user.role, action: 'approve', actor: user,
+        note: note ? `${note}${viaLabel ? ' ' + viaLabel : ''}` : viaLabel.trim(),
+        via: authority.via, delegationId: authority.delegation?.id || 0
+      })
       if (t.current_step + 1 < chain.length) {
-        // 中间级通过：流转下一节点并通知下一审批人
+        // 中间级通过：流转下一节点并通知下一审批人（含其有效代理人）；旧节点待办同事务归并已读
+        markActionableRead(taskId, step)
         const nextStep = chain[t.current_step + 1]
-        db.prepare('UPDATE approval_tasks SET current_step=current_step+1, version=version+1 WHERE id=?').run(taskId)
-        notify({
-          recipientRole: nextStep.role, type: 'task_submitted',
+        stampNodeDue(nextStep)
+        db.prepare('UPDATE approval_tasks SET current_step=current_step+1, chain=?, version=version+1 WHERE id=?')
+          .run(JSON.stringify(chain), taskId)
+        notifyStepAudience(t, nextStep, {
+          type: 'task_submitted',
           title: `${meta.label}审批流转至您`,
-          body: `「${who}」已由 ${user.name} 初审通过，待您终审`,
-          taskId, appId: t.application_id
+          body: `「${who}」已由 ${user.name}${viaLabel} 初审通过，待您终审`
         })
         return { ok: true, status: 'pending', next: nextStep.role }
       }
 
       // 终审通过：SAVEPOINT 内执行回写；业务状态漂移导致失败时仅回滚执行段，任务标记 failed 并通知申请人
+      // 终审节点的待办通知先在同事务归并，保证无论执行成功/失败铃铛都不残留
+      markActionableRead(taskId, step)
       db.exec('SAVEPOINT task_exec')
       let execDesc = '', execErr = null
       try {
@@ -1763,7 +1934,11 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
           db.prepare("UPDATE strategy_versions SET status='failed' WHERE id=? AND status='pending'")
             .run(num(payloadNow.strategy_version_id))
         }
-        addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'failed', actor: user, note: `审批通过但执行失败：${execErr.message}` })
+        addStep(taskId, {
+          stepNo: t.current_step, role: user.role, action: 'failed', actor: user,
+          note: `审批通过但执行失败：${execErr.message}${viaLabel ? ' ' + viaLabel : ''}`,
+          via: authority.via, delegationId: authority.delegation?.id || 0
+        })
         // 危机事件关联的应聘：审批回写失败也是关键处置事件，上链留痕
         auditPassive({
           category: 'decision', action: 'approval.failed', actor: user, applicationId: t.application_id,
@@ -1781,7 +1956,11 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
       }
       db.prepare("UPDATE approval_tasks SET status='approved', decided_at=?, decide_note=?, result_note=?, version=version+1 WHERE id=?")
         .run(stamp, note, execDesc, taskId)
-      addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'execute', actor: user, note: execDesc })
+      addStep(taskId, {
+        stepNo: t.current_step, role: user.role, action: 'execute', actor: user,
+        note: `${execDesc}${viaLabel ? ' ' + viaLabel : ''}`,
+        via: authority.via, delegationId: authority.delegation?.id || 0
+      })
       auditPassive({
         category: 'decision', action: 'approval.execute', actor: user, applicationId: t.application_id,
         refType: 'approval', refId: taskId,
@@ -1869,17 +2048,19 @@ app.post('/api/approvals/:id/resubmit', (req, res, next) => {
         summary = '重新提交推进申请'
       }
       const chain = buildChain(t.type, payload, a)
-      db.prepare("UPDATE approval_tasks SET payload=?, chain=?, current_step=0, status='pending', submitted_at=?, decide_note='', version=version+1 WHERE id=?")
+      if (chain[0]) stampNodeDue(chain[0])
+      // 重提重建审批链：旧链上各节点的未读待办全部归并，避免红点残留到已失效节点
+      markActionableRead(taskId)
+      db.prepare("UPDATE approval_tasks SET payload=?, chain=?, current_step=0, status='pending', submitted_at=?, decided_at='', decide_note='', result_note='', version=version+1 WHERE id=?")
         .run(JSON.stringify(payload), JSON.stringify(chain), ts(), taskId)
       addStep(taskId, { stepNo: -1, role: user.role, action: 'resubmit', actor: user, note: summary })
       const cand = a && db.prepare('SELECT name FROM candidates WHERE id=?').get(a.candidate_id)
       const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(a ? a.position_id : num(payload.position_id))
       const targetName = a ? `${cand?.name || ''} · ${pos?.name || ''}` : `${pos?.name || ''} 策略 v${payload.strategy_version_id}`
-      notify({
-        recipientRole: chain[0].role, type: 'task_resubmitted',
+      notifyStepAudience(t, chain[0], {
+        type: 'task_resubmitted',
         title: `${meta.label}申请已修改重提`,
-        body: `${user.name} 重新提交「${targetName}」：${summary}`,
-        taskId, appId: a ? a.id : 0
+        body: `${user.name} 重新提交「${targetName}」：${summary}`
       })
       return { ok: true, status: 'pending', chain }
     })
@@ -1907,14 +2088,18 @@ app.post('/api/approvals/:id/cancel', (req, res, next) => {
       addStep(taskId, { stepNo: -1, role: user.role, action: 'cancel', actor: user, note: String(req.body?.note || '') })
       if (t.status === 'pending') {
         const chain = parseJSON(t.chain, [])
+        const step = chain[t.current_step] || null
         const meta = TASK_TYPES[t.type]
         const payload = parseJSON(t.payload, {})
-        notify({
-          recipientRole: chain[t.current_step]?.role || '', type: 'task_cancelled',
-          title: `${meta?.label || '审批'}申请已撤销`,
-          body: `${user.name} 撤销了「${meta?.label || ''}」申请 #${taskId}${payload.strategy_version_id ? `（v${payload.strategy_version_id}）` : ''}`,
-          taskId, appId: t.application_id
-        })
+        // 当前节点受众（角色桶+代理人）的未读待办同事务归并，撤销后铃铛/红点立即清空
+        markActionableRead(taskId, step)
+        if (step) {
+          notifyStepAudience(t, step, {
+            type: 'task_cancelled',
+            title: `${meta?.label || '审批'}申请已撤销`,
+            body: `${user.name} 撤销了「${meta?.label || ''}」申请 #${taskId}${payload.strategy_version_id ? `（v${payload.strategy_version_id}）` : ''}`
+          })
+        }
       }
       return { ok: true, status: 'cancelled' }
     })
@@ -1923,15 +2108,240 @@ app.post('/api/approvals/:id/cancel', (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// 通知已读：默认把当前身份角色的未读全部标记；也可传 ids 精准标记
+// ---------------- 按角色审批委托 ----------------
+// 把当前身份的某节点角色审批权委托给代理人（可限定审批类型/应聘范围/到期时间）。
+// 授权同事务：① 给匹配的在途任务追加 delegate 留痕；② 给代理人投递个人待办；③ 事后可撤销/自动到期。
+app.post('/api/delegations', (req, res, next) => {
+  const user = currentUser(req)
+  const b = req.body || {}
+  try {
+    const out = tx(() => {
+      const role = String(b.role || '')
+      if (!ROLE_LABEL[role]) badRequest('委托的审批角色不存在', 'delegation_role_invalid')
+      if (user.role !== role) forbidden(`只能委托本人角色「${ROLE_LABEL[user.role]}」的审批权，不能代他人委托`, 'delegation_not_owner')
+      const delegateeId = String(b.delegatee_id || '')
+      const delegatee = db.prepare('SELECT * FROM users WHERE id=?').get(delegateeId)
+      if (!delegatee) badRequest('代理人不存在', 'delegatee_missing')
+      if (delegateeId === user.id) badRequest('不能委托给自己', 'delegation_self')
+      const types = Array.isArray(b.task_types)
+        ? [...new Set(b.task_types.filter(t => DELEGATABLE_TYPES.includes(t)))]
+        : []
+      if (!types.length) badRequest('请至少选择一种可委托的审批类型（推进/面试结论/Offer 发放）', 'delegation_types_required')
+      const scope = b.scope === 'applications' ? 'applications' : 'all'
+      const appIds = scope === 'applications' && Array.isArray(b.application_ids)
+        ? [...new Set(b.application_ids.map(num).filter(Boolean))]
+        : []
+      if (scope === 'applications' && !appIds.length) badRequest('指定应聘范围时必须选择应聘记录', 'delegation_scope_empty')
+      const note = String(b.note || '').trim()
+      if (!note) badRequest('委托必须填写事由（审计留痕）', 'delegation_note_required')
+      const expiresAt = windowInput(b.expires_at)
+      if (expiresAt && new Date(expiresAt).getTime() <= Date.now()) badRequest('到期时间必须晚于当前时间', 'delegation_expires_past')
+      // 同一委托人→代理人→角色 已存在有效委托时拒绝重复创建（撤销后可重建）
+      const dup = db.prepare("SELECT id FROM approval_delegations WHERE delegator_id=? AND delegatee_id=? AND role=? AND status='active'").get(user.id, delegateeId, role)
+      if (dup) conflict('该代理人已持有此角色的有效委托，请勿重复创建', 'delegation_duplicate')
+      const stamp = ts()
+      const r = db.prepare(`INSERT INTO approval_delegations
+          (delegator_id,delegator_name,delegatee_id,delegatee_name,role,task_types,scope,application_ids,note,status,expires_at,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?, 'active',?,?)`)
+        .run(user.id, user.name, delegateeId, delegatee.name, role, JSON.stringify(types), scope, JSON.stringify(appIds), note, expiresAt, stamp)
+      const delegationId = Number(r.lastInsertRowid)
+
+      // 在匹配的进行中任务上补留痕，并给代理人投递个人待办（角色桶原通知保留，无需重复发）
+      let taskCount = 0
+      const pending = db.prepare("SELECT * FROM approval_tasks WHERE status='pending' ORDER BY id").all()
+      pending.forEach(t => {
+        if (!types.includes(t.type)) return
+        if (scope === 'applications' && !appIds.includes(num(t.application_id))) return
+        const chain = parseJSON(t.chain, [])
+        const step = chain[t.current_step]
+        if (!step || step.role !== role) return
+        taskCount++
+        addStep(t.id, {
+          stepNo: num(t.current_step), role, action: 'delegate', actor: user,
+          note: `委托给 ${delegatee.name} 代为审批：${note}${expiresAt ? `（有效期至 ${fmtWindow(expiresAt)}）` : ''}`
+        })
+        const delegateeRole = db.prepare('SELECT role FROM users WHERE id=?').get(delegateeId)
+        if (delegateeRole?.role !== role) {
+          notify({
+            recipientRole: role, recipientId: delegateeId, delegationId, type: 'task_submitted',
+            title: '【代理审批】您收到新的代理审批任务',
+            body: `${user.name} 将「${TASK_TYPES[t.type]?.label || t.type}」#${t.id} 的${ROLE_LABEL[role]}节点委托给您：${note}`,
+            taskId: t.id, appId: num(t.application_id)
+          })
+        }
+      })
+      return { ok: true, id: delegationId, task_count: taskCount }
+    })
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 撤销委托：进行中任务的代理权限立即失效；代理人个人未读待办同事务归并已读，并补 delegate_revoke 留痕
+app.post('/api/delegations/:id/revoke', (req, res, next) => {
+  const user = currentUser(req)
+  const delegationId = num(req.params.id)
+  const note = String(req.body?.note || '').trim()
+  try {
+    const out = tx(() => {
+      const d = db.prepare('SELECT * FROM approval_delegations WHERE id=?').get(delegationId)
+      if (!d) return { notFound: true }
+      if (d.status !== 'active') conflict('该委托已失效，无需重复撤销', 'delegation_closed')
+      if (d.delegator_id !== user.id) forbidden('仅委托人本人可以撤销该委托', 'delegation_not_owner')
+      const stamp = ts()
+      db.prepare("UPDATE approval_delegations SET status='revoked', revoked_at=?, revoke_note=? WHERE id=?")
+        .run(stamp, note, delegationId)
+      const types = parseJSON(d.task_types, [])
+      const appIds = parseJSON(d.application_ids, []).map(x => num(x))
+      // 仍停留在被代理节点的进行中任务：追加撤销留痕
+      const pending = db.prepare("SELECT * FROM approval_tasks WHERE status='pending' ORDER BY id").all()
+      let taskCount = 0
+      pending.forEach(t => {
+        if (!types.includes(t.type)) return
+        if (d.scope === 'applications' && !appIds.includes(num(t.application_id))) return
+        const chain = parseJSON(t.chain, [])
+        const step = chain[t.current_step]
+        if (!step || step.role !== d.role) return
+        taskCount++
+        addStep(t.id, {
+          stepNo: num(t.current_step), role: d.role, action: 'delegate_revoke', actor: user,
+          note: `撤销对 ${d.delegatee_name} 的审批委托${note ? `：${note}` : ''}`
+        })
+      })
+      const readCount = markDelegateTodosRead(delegationId)
+      return { ok: true, task_count: taskCount, notifications_read: readCount }
+    })
+    if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found' })
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// ---------------- 超时升级规则配置（仅招聘负责人） ----------------
+app.post('/api/escalation-rules', (req, res, next) => {
+  const user = currentUser(req)
+  const rows = Array.isArray(req.body?.rules) ? req.body.rules : null
+  try {
+    const out = tx(() => {
+      if (user.role !== 'recruiter') forbidden('仅招聘负责人可配置审批超时升级规则', 'role_not_allowed')
+      if (!rows) badRequest('规则列表不能为空', 'rules_required')
+      const stamp = ts()
+      const saved = []
+      rows.forEach(row => {
+        const type = String(row.task_type || '')
+        const role = String(row.role || '')
+        if (!DELEGATABLE_TYPES.includes(type) || !ROLE_LABEL[role]) return
+        const hours = Math.round(num(row.timeout_hours, 0) * 10) / 10
+        const target = String(row.escalate_to || '')
+        const enabled = row.enabled === false ? 0 : 1
+        if (enabled) {
+          if (!(hours > 0)) badRequest('超时时限必须大于 0 小时', 'escalation_timeout_invalid')
+          if (!ROLE_LABEL[target]) badRequest('升级目标角色不存在', 'escalation_target_invalid')
+          if (target === role) badRequest('升级目标不能与当前节点角色相同（防升级环）', 'escalation_loop')
+        }
+        db.prepare(`INSERT INTO approval_escalation_rules(task_type,role,timeout_hours,escalate_to,enabled,updated_by,updated_at)
+                    VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(task_type,role) DO UPDATE SET
+                      timeout_hours=excluded.timeout_hours,escalate_to=excluded.escalate_to,
+                      enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at`)
+          .run(type, role, hours, target, enabled, user.name, stamp)
+        saved.push({ task_type: type, role, timeout_hours: hours, escalate_to: target, enabled: !!enabled })
+      })
+      if (!saved.length) badRequest('没有可保存的有效规则', 'rules_empty')
+      return { ok: true, saved }
+    })
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// ---------------- 超时升级扫描（幂等） ----------------
+// 委托到期先失效；再对超过当前节点 SLA deadline 的 pending 任务在链尾追加升级节点（原节点保留）。
+// 每个任务独立 BEGIN IMMEDIATE 事务 + 状态/截止时间二次检查，并发/重复 sweep 不会重复升级；
+// 审批链快照原样保留，升级动作、状态指针、通知在同一事务内提交。
+function expireDelegations(atMs = Date.now()) {
+  const rows = db.prepare("SELECT * FROM approval_delegations WHERE status='active' AND expires_at!=''").all()
+  let n = 0
+  rows.forEach(d => {
+    const exp = new Date(d.expires_at).getTime()
+    if (Number.isFinite(exp) && exp <= atMs) {
+      db.prepare("UPDATE approval_delegations SET status='expired' WHERE id=? AND status='active'").run(d.id)
+      markDelegateTodosRead(d.id)
+      n++
+    }
+  })
+  return n
+}
+
+function escalateDueTasks(at = new Date().toISOString(), atLocale = ts()) {
+  const due = db.prepare("SELECT id FROM approval_tasks WHERE status='pending' ORDER BY id").all()
+  const out = []
+  due.forEach(({ id }) => {
+    tx(() => {
+      // 委托到期在每个升级事务内顺带处理，保证并发扫描下到期代理立即失权
+      expireDelegations(Date.now())
+      const t = db.prepare('SELECT * FROM approval_tasks WHERE id=?').get(id)
+      if (!t || t.status !== 'pending') return
+      const chain = parseJSON(t.chain, [])
+      const idx = num(t.current_step)
+      const step = chain[idx]
+      if (!step || !step.sla || step.escalated_at) return
+      // 兼容旧任务：节点从未进入计时则补打 deadline，不立即升级
+      if (!step.due_at) { stampNodeDue(step); db.prepare('UPDATE approval_tasks SET chain=? WHERE id=?').run(JSON.stringify(chain), t.id); return }
+      if (step.due_at > atLocale) return
+      const targetRole = String(step.sla.escalate_to || '')
+      if (!ROLE_LABEL[targetRole]) return
+      // 防升级环：目标角色已存在于链上（审批中或曾升级）则不再追加，避免无限升级
+      if (chain.some(n => n.role === targetRole)) return
+      const meta = TASK_TYPES[t.type]
+      const overdueH = step.sla.timeout_hours
+      // 旧节点标记已升级（阻断对该节点重复升级，原节点与 SLA 快照完整保留）；新节点从链尾继续计时
+      step.escalated_at = atLocale
+      step.escalated_to = targetRole
+      const newNode = stampNodeDue({
+        role: targetRole,
+        reason: `超时升级：${ROLE_LABEL[step.role]}超过 ${overdueH}h 未处理`,
+        escalated_from: step.role,
+        escalated_node_at: atLocale,
+        due_at_origin: step.due_at
+      })
+      // 新节点继续适用目标角色自己的 SLA 规则（取当前生效规则快照；无规则则不再继续升级）
+      const nextSla = ruleSlaSnapshot(t.type, targetRole)
+      if (nextSla) newNode.sla = nextSla
+      // 旧节点待办（角色桶+代理人）在升级瞬间归并，防止红点残留
+      markActionableRead(t.id, step)
+      chain.push(newNode)
+      db.prepare('UPDATE approval_tasks SET chain=?, current_step=?, version=version+1 WHERE id=?')
+        .run(JSON.stringify(chain), chain.length - 1, t.id)
+      addStep(t.id, {
+        stepNo: chain.length - 1, role: targetRole, action: 'escalate', actor: { id: 'system', name: '系统超时守护' },
+        note: `${ROLE_LABEL[step.role]}节点超过 SLA ${overdueH}h（截止 ${step.due_at}）未审批，自动升级至${ROLE_LABEL[targetRole]}`
+      })
+      notifyStepAudience(t, newNode, {
+        type: 'task_escalated',
+        title: `⏰ ${meta?.label || '审批'}超时升级待处理`,
+        body: `任务 #${t.id} 的${ROLE_LABEL[step.role]}节点已超时，升级到您处理（原截止 ${step.due_at}）`
+      })
+      out.push({ task_id: t.id, type: t.type, from: step.role, to: targetRole, due: step.due_at })
+    })
+  })
+  return out
+}
+
+app.get('/api/approvals/sweep', (req, res) => {
+  const expired = tx(() => expireDelegations(Date.now()))
+  const escalated = escalateDueTasks()
+  res.json({ ok: true, delegations_expired: expired, escalated, count: escalated.length })
+})
+
+// 通知已读：默认把当前身份角色桶 + 本人个人收件箱（代理/升级待办）的未读全部标记；也可传 ids 精准标记
 app.post('/api/notifications/read', (req, res) => {
   const user = currentUser(req)
   const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(num).filter(Boolean) : []
   if (ids.length) {
     const marks = ids.map(() => '?').join(',')
-    db.prepare(`UPDATE notifications SET is_read=1 WHERE recipient_role=? AND id IN (${marks})`).run(user.role, ...ids)
+    db.prepare(`UPDATE notifications SET is_read=1 WHERE (recipient_role=? OR recipient_id=?) AND id IN (${marks})`)
+      .run(user.role, user.id, ...ids)
   } else {
-    db.prepare('UPDATE notifications SET is_read=1 WHERE recipient_role=? AND is_read=0').run(user.role)
+    db.prepare('UPDATE notifications SET is_read=1 WHERE is_read=0 AND (recipient_role=? OR recipient_id=?)')
+      .run(user.role, user.id)
   }
   res.json({ ok: true })
 })
@@ -2039,6 +2449,15 @@ try {
   if (due.length) console.log(`[HR] strategy window swept ${due.length} version(s)`)
 } catch (e) {
   console.error('[HR] strategy window sweep failed:', e)
+}
+try {
+  const expired = tx(() => expireDelegations(Date.now()))
+  const escalated = escalateDueTasks()
+  if (expired || escalated.length) {
+    console.log(`[HR] approval sweep: ${expired} delegation(s) expired, ${escalated.length} task(s) escalated`)
+  }
+} catch (e) {
+  console.error('[HR] approval escalation sweep failed:', e)
 }
 
 // 挂载跨角色危机处置审计模块（路由 + 哈希链 + 责任回写），并注入主流程回退执行器
